@@ -196,9 +196,16 @@
 (define (em--pass-file)     (path-join (em--acct-dir) "app-password"))
 (define (em--messages-dir)  (path-join (em--acct-dir) "messages"))
 (define (em--msg-file id)   (path-join (em--messages-dir) id))
-(define (em--client-id)     (em--trim (em--knob "email-client-id" "")))
-(define (em--client-secret) (em--trim (em--knob "email-client-secret" "")))
-(define (em--query)         (em--knob "email-query" "in:inbox"))
+;; A PER-ACCOUNT knob: the "<base>:<account>" option when set, else the plain
+;; "<base>" option, else `fallback`. Lets accounts that need distinct values
+;; (separate GCP OAuth clients, a different sync query) override the global.
+(define (em--knob-acct base fallback)
+  (em--knob (string-append base ":" (em--account))
+            (em--knob base fallback)))
+
+(define (em--client-id)     (em--trim (em--knob-acct "email-client-id" "")))
+(define (em--client-secret) (em--trim (em--knob-acct "email-client-secret" "")))
+(define (em--query)         (em--knob-acct "email-query" "in:inbox"))
 (define (em--imap-host)     (em--knob "email-imap-host" "imap.gmail.com"))
 (define (em--smtp-host)     (em--knob "email-smtp-host" "smtp.gmail.com"))
 (define (em--fetch-count)

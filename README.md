@@ -75,9 +75,24 @@ once with the new method's credential.
 2. **APIs & Services → Library** → enable the **Gmail API**.
 3. **OAuth consent screen** → External → add **yourself as a test user**.
 4. **Credentials → Create credentials → OAuth client ID** → **Desktop app**;
-   copy the client id + secret into the options above. One client works for
+   copy the client id + secret into the options above. One client can serve
    every oauth account — you pick which Google account to consent as in the
    browser each time you press `L`.
+
+**Per-account credentials.** If your accounts use *different* GCP clients,
+scope the option to the account name — `email-client-id:<account>` /
+`email-client-secret:<account>` win over the unscoped `email-client-id` for
+that account:
+
+```scheme
+(set-option "email-client-id:me@gmail.com"     "…apps.googleusercontent.com")
+(set-option "email-client-secret:me@gmail.com" "…")
+(set-option "email-client-id:me@work.com"      "…other…apps.googleusercontent.com")
+(set-option "email-client-secret:me@work.com"  "…")
+```
+
+The same `:<account>` suffix also works for `email-query`, so a mailbox can
+have its own sync scope.
 
 Gotchas of Google's making: while the consent screen is in **Testing**
 status, refresh tokens expire after 7 days — push the app to **Production**
