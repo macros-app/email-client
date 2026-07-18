@@ -1,0 +1,5 @@
+# Local credentials / cached tokens must never be committed.
+accounts.scm
+*.token
+app-password
+token
