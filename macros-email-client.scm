@@ -183,7 +183,7 @@
 ;; keychain credential; ONE is active at a time, and switching saves + swaps
 ;; the store.
 ;; Parse the option VALUE into a list of account hashes (split out so it's
-;; testable without the editor's option store).
+;; testable without the editor's option store). '() when unset/empty.
 (define (em--parse-accounts v)
   (cond
     ;; A Scheme list of account hashes (the canonical form).
@@ -198,11 +198,45 @@
                                 (car (cdr parts)) "oauth"))))
           (filter (lambda (t) (not (equal? t "")))
                   (em--split-char (replace-regexp-in-string "\\s+" " " (em--trim v)) #\space))))
-    ;; Unset / empty → a single "default" account.
-    (else
-     (list (hash 'name "default" 'method (em--knob "email-auth-method" "oauth"))))))
+    (else '())))
 
-(define (em--accounts) (em--parse-accounts (get-option "email-accounts")))
+;; ~/.config/macros/email-client.conf — a Scheme file written by the
+;; M-x email-add-account wizard and freely hand-editable. It must evaluate
+;; to a list of account hashes (same fields as "email-accounts"); its
+;; entries are merged over the option's list, keyed by 'name.
+(define (em--conf-file) "~/.config/macros/email-client.conf")
+
+(define (em--conf-accounts)
+  (let ((path (em--expand-home (em--conf-file))))
+    (if (not (file-exists? path)) '()
+        (let ((v (with-handler
+                  (lambda (e)
+                    (message (string-append "email: " (em--conf-file)
+                                            " failed to evaluate — fix it or delete it"))
+                    '())
+                  (eval-string (read-file path)))))
+          (if (list? v) (filter hash? v) '())))))
+
+;; Overlay `extra` onto `base`: an entry whose 'name already exists replaces
+;; it in place; a new 'name appends. Order of `base` is preserved.
+(define (em--merge-accounts base extra)
+  (let loop ((es extra) (acc base))
+    (if (null? es) acc
+        (loop (cdr es)
+              (let* ((e (car es)) (n (em--acc-name e)))
+                (let sub ((as acc) (out '()) (found #f))
+                  (cond ((null? as) (reverse (if found out (cons e out))))
+                        ((equal? (em--acc-name (car as)) n)
+                         (sub (cdr as) (cons e out) #t))
+                        (else (sub (cdr as) (cons (car as) out) found)))))))))
+
+(define (em--accounts)
+  (let ((merged (em--merge-accounts
+                 (em--parse-accounts (get-option "email-accounts"))
+                 (em--conf-accounts))))
+    (if (null? merged)
+        (list (hash 'name "default" 'method (em--knob "email-auth-method" "oauth")))
+        merged)))
 
 (define (em--acc-name a) (em--jstr (hash-try-get a 'name)))
 
@@ -3280,6 +3314,7 @@
                    (list "Account"
                          (list "a" "Next account"  'email-cycle-account)
                          (list "w" "Switch account…" 'email-switch-account)
+                         (list "n" "New account…"  'email-add-account)
                          (list "L" "Log in"        'email-login))
                    (list "Offline"
                          (list "O" "Outbox"        'email-outbox)
@@ -3408,6 +3443,147 @@
          (cons 'access-token #f) (cons 'token-expiry 0)
          (cons 'refresh-token #f) (cons 'token-loaded #f)
          (cons 'app-pass #f) (cons 'pass-loaded #f))))
+
+;; ── account wizard ──────────────────────────────────────────────────────────
+;; M-x email-add-account — guided setup: method → address → (oauth: client-id
+;; → client-secret | app-password: the password). Secrets are appended to
+;; ~/.authinfo (created 600 if missing); the account itself is appended to
+;; the email-client.conf Scheme file, which em--accounts merges in.
+
+(define em--conf-fields
+  (list 'name 'method 'query 'address 'from-name 'imap-host 'smtp-host 'mode
+        'maildir 'fetch-count 'auto-sync-minutes 'authinfo 'client-id 'client-secret))
+
+(define (em--conf-escape s)
+  (list->string
+   (reverse
+    (let loop ((cs (string->list s)) (out '()))
+      (cond ((null? cs) out)
+            ((or (equal? (car cs) #\") (equal? (car cs) #\\))
+             (loop (cdr cs) (cons (car cs) (cons #\\ out))))
+            (else (loop (cdr cs) (cons (car cs) out))))))))
+
+(define (em--conf-render-account a)
+  (string-append
+   " (hash"
+   (apply string-append
+          (map (lambda (f)
+                 (let ((v (em--j a f)))
+                   (if (and (string? v) (not (equal? v "")))
+                       (string-append " '" (symbol->string f)
+                                      " \"" (em--conf-escape v) "\"")
+                       "")))
+               em--conf-fields))
+   ")\n"))
+
+(define (em--conf-render accounts)
+  (string-append
+   ";; macros-email-client accounts — written by M-x email-add-account and\n"
+   ";; yours to edit. Must evaluate to a LIST OF ACCOUNT HASHES; every field\n"
+   ";; but 'name is optional (see the package README for the field list).\n"
+   ";; Secrets belong in ~/.authinfo, not here. Merged over the\n"
+   ";; \"email-accounts\" option by 'name. The wizard rewrites this file,\n"
+   ";; keeping known fields only — comments do not survive a rewrite.\n"
+   "(list\n"
+   (apply string-append (map em--conf-render-account accounts))
+   ")\n"))
+
+(define (em--conf-save accounts)
+  (let ((path (em--expand-home (em--conf-file))))
+    (write-file path (em--conf-render accounts))
+    (call-process-full "chmod" (list "600" path) "")))
+
+(define (em--ends-newline? s)
+  (let ((n (string-length s)))
+    (and (> n 0) (equal? (substring s (- n 1) n) "\n"))))
+
+(define (em--contains-space? s)
+  (let loop ((cs (string->list s)))
+    (cond ((null? cs) #f)
+          ((equal? (car cs) #\space) #t)
+          (else (loop (cdr cs))))))
+
+(define (em--authinfo-quote s)
+  (if (em--contains-space? s) (string-append "\"" s "\"") s))
+
+;; Append (machine login secret) entries to ~/.authinfo, creating it 600 if
+;; missing. An entry whose machine+login already resolve is skipped, so
+;; re-running the wizard never duplicates (or shadows) a line.
+(define (em--authinfo-append! entries)
+  (let* ((path (em--expand-home "~/.authinfo"))
+         (existing (if (file-exists? path) (read-file path) ""))
+         (add (filter (lambda (e)
+                        (not (em--authinfo-find-in existing (nth e 0) (nth e 1))))
+                      entries)))
+    (when (pair? add)
+      (write-file
+       path
+       (string-append
+        existing
+        (if (or (equal? existing "") (em--ends-newline? existing)) "" "\n")
+        (apply string-append
+               (map (lambda (e)
+                      (string-append "machine " (nth e 0) " login " (nth e 1)
+                                     " password " (em--authinfo-quote (nth e 2)) "\n"))
+                    add))))
+      (call-process-full "chmod" (list "600" path) ""))
+    (em--st! 'authinfo-cache (hash))))
+
+(define (em--wizard-finish addr method entries)
+  (em--authinfo-append! entries)
+  (em--conf-save (em--merge-accounts (em--conf-accounts)
+                                     (list (hash 'name addr 'method method))))
+  (em--do-switch addr)
+  (message (string-append "email: added " addr " (" method ") — config in "
+                          (em--conf-file) ", secrets in ~/.authinfo; L to log in")))
+
+(define (email-add-account)
+  (read-string
+   "Account type (oauth / app-password): "
+   (lambda (t0)
+     (let ((method (let ((t (em--downcase (em--trim t0))))
+                     (cond ((or (equal? t "o") (equal? t "oauth")) "oauth")
+                           ((or (equal? t "a") (equal? t "app-password")
+                                (equal? t "app password")) "app-password")
+                           (else #f)))))
+       (if (not method)
+           (message "email: account type must be oauth or app-password")
+           (read-string
+            "Email address: "
+            (lambda (a0)
+              (let ((addr (em--trim a0)))
+                (cond
+                  ((equal? addr "") (message "email: empty address"))
+                  ((em--account-exists? addr)
+                   (message (string-append "email: account " addr " is already configured")))
+                  ((equal? method "oauth")
+                   (read-string
+                    "OAuth client-id: "
+                    (lambda (id0)
+                      (let ((cid (em--trim id0)))
+                        (if (equal? cid "")
+                            (message "email: empty client-id")
+                            (read-string
+                             "OAuth client-secret: "
+                             (lambda (sec0)
+                               (let ((sec (em--trim sec0)))
+                                 (if (equal? sec "")
+                                     (message "email: empty client-secret")
+                                     (em--wizard-finish
+                                      addr "oauth"
+                                      (list (list addr "client-id" cid)
+                                            (list addr "client-secret" sec))))))))))))
+                  (else
+                   (read-string
+                    "App password (myaccount.google.com/apppasswords): "
+                    (lambda (p0)
+                      (let ((pw (em--trim p0)))
+                        (if (equal? pw "")
+                            (message "email: empty app password")
+                            (em--wizard-finish
+                             addr "app-password"
+                             (list (list (em--knob "email-imap-host" "imap.gmail.com")
+                                         addr pw)))))))))))))))))
 
 (define (em--do-switch name)
   (cond
@@ -4515,6 +4691,7 @@
 (register-command "email-folder-all")
 (register-command "email-folder-trash")
 (register-command "email-switch-account")
+(register-command "email-add-account")
 (register-command "email-reload-authinfo")
 (register-command "email-cycle-account")
 (register-command "email-list-refresh")

@@ -56,6 +56,34 @@ method comes from the `email-auth-method` option (default `"oauth"`).
 (This works because macros' `set-option` stores structured Scheme values —
 lists and hashes — not just strings, so config stays pure Scheme.)
 
+### Interactive setup: `M-x email-add-account`
+
+You don't have to edit config at all. `M-x email-add-account` (or `n` in the
+`?` menu) walks you through it: account type (`oauth` / `app-password`) →
+email address → the credentials for that type. When it finishes:
+
+- **Secrets go to `~/.authinfo`** (created `chmod 600` if missing, appended
+  otherwise — lines whose machine+login already resolve are skipped, so
+  re-running never duplicates an entry).
+- **The account itself goes to `~/.config/macros/email-client.conf`** — a
+  plain Scheme file that must evaluate to a list of account hashes:
+
+  ```scheme
+  (list
+   (hash 'name "me@gmail.com" 'method "oauth")
+   (hash 'name "work@corp.com" 'method "app-password"))
+  ```
+
+- The new account is switched to; press `L` to log in.
+
+`email-client.conf` is yours to edit — add any per-account field
+(`'query`, `'maildir`, `'mode`, …) by hand. At load its entries are
+**merged over the `email-accounts` option by `'name`**: a matching name
+replaces the option's entry, a new name appends. So init.scm accounts and
+wizard-created accounts coexist, and the conf wins on conflict. One caveat:
+the wizard rewrites the file when adding an account, keeping known fields
+but not comments.
+
 A few more optional overrides (rarely needed): `email-address` sets the
 `From:` address when it differs from the logged-in account (send-as aliases);
 `email-git-repo` sets the default repo for the patch workflow (below);
