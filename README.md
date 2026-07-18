@@ -111,6 +111,42 @@ continue*. It's your own client; the only user is you.
 3. `L` in the account → enter the address, paste the 16-character password
    (spaces fine). It's verified against `imap.gmail.com` before being stored.
 
+### Keeping secrets out of init.scm: `~/.authinfo`
+
+Instead of putting `client-id` / `client-secret` / app passwords in
+init.scm, you can keep them in an Emacs-style **authinfo** file — netrc
+format, one credential per line:
+
+```
+machine imap.gmail.com login work@corp.com password abcdefghijklmnop
+machine me@gmail.com   login client-id     password 1234-….apps.googleusercontent.com
+machine me@gmail.com   login client-secret password GOCSPX-…
+```
+
+- **App passwords** use mu4e's convention: `machine` = the account's IMAP
+  host, `login` = the account name.
+- **OAuth client credentials** use `machine` = the account name, `login` =
+  `client-id` / `client-secret`.
+- `#` comments, `"double quotes"` around values with spaces, and a bare
+  `default` entry (matches any machine) all work as in Emacs.
+
+Lookup order for each secret: the account hash → the global `email-…`
+option → authinfo. Files searched: the account's `'authinfo` field, else the
+`email-authinfo` option, else `~/.authinfo.gpg`, `~/.authinfo`, `~/.netrc` —
+first match wins.
+
+A path ending in `.gpg` is decrypted by piping through `gpg --decrypt`
+(gpg-agent/pinentry supplies the passphrase — with `pinentry-mac` you get a
+GUI prompt and optional Keychain caching). Encrypting is one command —
+`gpg -e -r you@example.com ~/.authinfo` writes `~/.authinfo.gpg`; delete the
+plaintext after. Plaintext works too — `chmod 600` it. Decrypted text is cached for the session;
+`M-x email-reload-authinfo` re-reads after edits.
+
+Note the OAuth **refresh token** (the credential that actually grants
+mailbox access) is never read from authinfo — the app stores it in the
+macOS Keychain (falling back to a `chmod 600` file under the account's
+data dir).
+
 ## Where mail is stored on disk
 
 Everything lives under the **data directory** — `~/.macros-email` by

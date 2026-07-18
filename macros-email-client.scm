@@ -73,6 +73,8 @@
 ;;               ;; oauth accounts (one GCP client covers all of them):
 ;;               (set-option "email-client-id"     "…apps.googleusercontent.com")
 ;;               (set-option "email-client-secret" "…")
+;;               ;; …or keep secrets OUT of init.scm entirely: ~/.authinfo
+;;               ;; (netrc format, .gpg supported) — see the authinfo section.
 ;;               (set-option "email-query"         "in:inbox")  ; REST sync scope
 ;;               ;; shared:
 ;;               (set-option "email-fetch-count"   "100")       ; first-sync size
@@ -241,8 +243,14 @@
 (define (em--pass-file)     (path-join (em--acct-dir) "app-password"))
 (define (em--messages-dir)  (path-join (em--acct-dir) "messages"))
 (define (em--msg-file id)   (path-join (em--messages-dir) id))
-(define (em--client-id)     (em--trim (em--acct 'client-id "email-client-id" "")))
-(define (em--client-secret) (em--trim (em--acct 'client-secret "email-client-secret" "")))
+;; OAuth client credentials: account hash → global option → authinfo
+;; (machine = account name, login = the field; see the authinfo section).
+(define (em--client-id)
+  (let ((v (em--trim (em--acct 'client-id "email-client-id" ""))))
+    (if (equal? v "") (or (em--authinfo-find (em--account) "client-id") "") v)))
+(define (em--client-secret)
+  (let ((v (em--trim (em--acct 'client-secret "email-client-secret" ""))))
+    (if (equal? v "") (or (em--authinfo-find (em--account) "client-secret") "") v)))
 (define (em--query)         (em--acct 'query "email-query" "in:inbox"))
 (define (em--imap-host)     (em--acct 'imap-host "email-imap-host" "imap.gmail.com"))
 (define (em--smtp-host)     (em--acct 'smtp-host "email-smtp-host" "smtp.gmail.com"))
@@ -1538,6 +1546,133 @@
   (when (em--oauth?)
     (em--run-op (lambda () (em--replay-ops-rest (lambda () (em--op-done)))))))
 
+;; ── authinfo ────────────────────────────────────────────────────────────────
+;; Emacs auth-source, translated: secrets live in a netrc-format file instead
+;; of init.scm. Plaintext or GPG-encrypted — a path ending in .gpg is piped
+;; through `gpg --decrypt` (gpg-agent/pinentry supplies the passphrase).
+;;
+;;   machine imap.gmail.com login work@corp.com password <app-password>
+;;   machine me@gmail.com   login client-id     password <….googleusercontent.com>
+;;   machine me@gmail.com   login client-secret password <GOCSPX-…>
+;;
+;; App passwords key on machine = the account's IMAP host, login = the account
+;; name (mu4e's convention); OAuth client credentials key on machine = the
+;; account name, login = the field. Lookup order per secret: the account hash
+;; → the global "email-…" option → authinfo. Files searched: the account's
+;; 'authinfo field, else the "email-authinfo" option, else ~/.authinfo.gpg,
+;; ~/.authinfo, ~/.netrc — first match wins.
+
+;; netrc tokens: whitespace-separated words; "double quotes" group a value
+;; containing spaces; # at the start of a token comments to end of line.
+;; One char-list pass (no byte/char index mixing).
+(define (em--authinfo-tokenize s)
+  (let loop ((cs (string->list s)) (cur '()) (toks '()) (q #f) (c #f))
+    (let ((flushed (if (null? cur) toks (cons (list->string (reverse cur)) toks))))
+      (cond
+        ((null? cs) (reverse flushed))
+        (c (loop (cdr cs) '() toks q (not (equal? (car cs) #\newline))))
+        (q (if (equal? (car cs) #\")
+               (loop (cdr cs) cur toks #f #f)
+               (loop (cdr cs) (cons (car cs) cur) toks #t #f)))
+        ((equal? (car cs) #\") (loop (cdr cs) cur toks #t #f))
+        ((and (equal? (car cs) #\#) (null? cur)) (loop (cdr cs) '() toks #f #t))
+        ((or (equal? (car cs) #\space) (equal? (car cs) #\tab)
+             (equal? (car cs) #\newline) (equal? (car cs) #\return))
+         (loop (cdr cs) '() flushed #f #f))
+        (else (loop (cdr cs) (cons (car cs) cur) toks #f #f))))))
+
+(define (em--authinfo-key t)
+  (cond ((equal? t "login") 'login)
+        ((equal? t "password") 'password)
+        ((equal? t "port") 'port)
+        (else #f)))
+
+;; Token stream → list of {machine login password port} hashes. An entry
+;; starts at "machine <name>" (or bare "default", which matches any machine).
+(define (em--authinfo-entries text)
+  (let loop ((ts (em--authinfo-tokenize text)) (cur #f) (out '()))
+    (cond
+      ((null? ts) (reverse (if cur (cons cur out) out)))
+      ((equal? (car ts) "default")
+       (loop (cdr ts) (hash 'machine "") (if cur (cons cur out) out)))
+      ((and (equal? (car ts) "machine") (pair? (cdr ts)))
+       (loop (cdr (cdr ts)) (hash 'machine (car (cdr ts))) (if cur (cons cur out) out)))
+      ((not cur) (loop (cdr ts) #f out))
+      ((and (pair? (cdr ts)) (em--authinfo-key (car ts)))
+       (loop (cdr (cdr ts)) (hash-insert cur (em--authinfo-key (car ts)) (car (cdr ts))) out))
+      (else (loop (cdr ts) cur out)))))
+
+;; First password in TEXT whose machine and login match. A "default" entry
+;; (machine "") matches any machine; a login of "" on either side is a
+;; wildcard. Pure — the file/decrypt layer is separate, so this is testable.
+(define (em--authinfo-find-in text machine login)
+  (let loop ((es (em--authinfo-entries text)))
+    (if (null? es) #f
+        (let* ((e (car es))
+               (m (em--jstr (em--j e 'machine)))
+               (l (em--jstr (em--j e 'login)))
+               (p (em--jstr (em--j e 'password))))
+          (if (and (or (equal? m "") (equal? m machine))
+                   (or (equal? login "") (equal? l "") (equal? l login))
+                   (not (equal? p "")))
+              p
+              (loop (cdr es)))))))
+
+(define (em--authinfo-files)
+  (let ((v (em--trim (em--acct 'authinfo "email-authinfo" ""))))
+    (if (equal? v "")
+        (list "~/.authinfo.gpg" "~/.authinfo" "~/.netrc")
+        (list v))))
+
+;; GUI launches get the bare system PATH, so probe the usual gpg homes.
+(define (em--gpg-bin)
+  (let loop ((cs (list "/opt/homebrew/bin/gpg" "/usr/local/bin/gpg"
+                       "/opt/local/bin/gpg" "/usr/bin/gpg")))
+    (cond ((null? cs) "gpg")
+          ((file-exists? (car cs)) (car cs))
+          (else (loop (cdr cs))))))
+
+(define (em--gpg-file? p)
+  (let ((n (string-length p)))
+    (and (> n 4) (equal? (substring p (- n 4) n) ".gpg"))))
+
+;; Read (and decrypt) one authinfo file, caching the text per path for the
+;; session — a pinentry prompt happens at most once, not on every lookup.
+;; "" caches a missing/failed read; M-x email-reload-authinfo clears.
+(define (em--authinfo-text path0)
+  (let* ((path (em--expand-home path0))
+         (cache (let ((c (em--st 'authinfo-cache))) (if (hash? c) c (hash))))
+         (hit (hash-try-get cache path)))
+    (cond
+      ((string? hit) (if (equal? hit "") #f hit))
+      ((not (file-exists? path))
+       (em--st! 'authinfo-cache (hash-insert cache path ""))
+       #f)
+      (else
+       (let ((text
+              (if (em--gpg-file? path)
+                  (let ((r (call-process-full (em--gpg-bin)
+                                              (list "--quiet" "--batch" "--decrypt" path)
+                                              "")))
+                    (if (equal? (car r) "0")
+                        (car (cdr r))
+                        (begin (message (string-append "email: gpg failed to decrypt " path)) "")))
+                  (read-file path))))
+         (em--st! 'authinfo-cache (hash-insert cache path text))
+         (if (equal? text "") #f text))))))
+
+(define (em--authinfo-find machine login)
+  (let loop ((fs (em--authinfo-files)))
+    (if (null? fs) #f
+        (or (let ((text (em--authinfo-text (car fs))))
+              (and text (em--authinfo-find-in text machine login)))
+            (loop (cdr fs))))))
+
+;; Forget cached authinfo text (after editing the file mid-session).
+(define (email-reload-authinfo)
+  (em--st! 'authinfo-cache (hash))
+  (message "email: authinfo cache cleared"))
+
 ;; ── keychain ────────────────────────────────────────────────────────────────
 ;; One keychain entry per account per credential kind, so mailboxes never
 ;; share or clobber each other's secrets.
@@ -1579,12 +1714,19 @@
 (define (em--app-pass)
   (when (not (em--st 'pass-loaded))
     (em--st! 'pass-loaded #t)
-    (let ((kc (em--keychain-read (em--kc-pass))))
-      (cond
-        ((and kc (not (equal? kc ""))) (em--st! 'app-pass kc))
-        ((file-exists? (em--pass-file))
-         (let ((t (em--trim (read-file (em--pass-file)))))
-           (when (not (equal? t "")) (em--st! 'app-pass t)))))))
+    ;; authinfo first (declared config beats a cached prompt): mu4e-style
+    ;; machine <imap-host> login <account>, or machine <account> login
+    ;; app-password. Then the keychain / file the login prompt saved to.
+    (let ((ai (or (em--authinfo-find (em--imap-host) (em--account))
+                  (em--authinfo-find (em--account) "app-password"))))
+      (if ai
+          (em--st! 'app-pass ai)
+          (let ((kc (em--keychain-read (em--kc-pass))))
+            (cond
+              ((and kc (not (equal? kc ""))) (em--st! 'app-pass kc))
+              ((file-exists? (em--pass-file))
+               (let ((t (em--trim (read-file (em--pass-file)))))
+                 (when (not (equal? t "")) (em--st! 'app-pass t)))))))))
   (em--st 'app-pass))
 
 (define (em--save-app-pass secret)
@@ -4373,6 +4515,7 @@
 (register-command "email-folder-all")
 (register-command "email-folder-trash")
 (register-command "email-switch-account")
+(register-command "email-reload-authinfo")
 (register-command "email-cycle-account")
 (register-command "email-list-refresh")
 (register-command "email-list-quit")
