@@ -160,42 +160,47 @@
       p))
 
 ;; ── accounts ────────────────────────────────────────────────────────────────
-;; The "email-accounts" option is an ARRAY OF ACCOUNT CONFIGURATIONS — a JSON
-;; array of objects, one self-contained config per mailbox:
+;; The "email-accounts" option is an ARRAY OF ACCOUNT CONFIGURATIONS — a plain
+;; Scheme LIST OF HASHES, one self-contained config per mailbox:
 ;;
-;;   [{"name": "me@gmail.com", "method": "oauth",
-;;     "client-id": "…", "client-secret": "…"},
-;;    {"name": "work@corp.com", "method": "app-password", "query": "in:inbox"}]
+;;   (set-option "email-accounts"
+;;     (list (hash 'name "me@gmail.com" 'method "oauth"
+;;                 'client-id "…" 'client-secret "…")
+;;           (hash 'name "work@corp.com" 'method "app-password"
+;;                 'query "in:inbox")))
 ;;
 ;; Recognized fields (all optional except name): method, client-id,
 ;; client-secret, query, address, from-name, imap-host, smtp-host, mode,
 ;; maildir, fetch-count, auto-sync-minutes. Any omitted field falls back to the
 ;; matching global "email-<field>" option, then a built-in default — so shared
-;; settings stay global and only per-mailbox differences go in the object.
+;; settings stay global and only per-mailbox differences go in the hash.
 ;;
 ;; Still accepted for simple setups: the legacy whitespace-separated
 ;; "name|method" string. Unset → one account "default" using
 ;; "email-auth-method". Each account owns a data-dir subdirectory and its own
 ;; keychain credential; ONE is active at a time, and switching saves + swaps
 ;; the store.
-(define (em--accounts)
-  (let ((s (em--trim (em--knob "email-accounts" ""))))
-    (cond
-      ((equal? s "")
-       (list (hash 'name "default" 'method (em--knob "email-auth-method" "oauth"))))
-      ((starts-with? s "[")                         ; JSON array of objects
-       (let ((j (string->jsexpr s)))
-         (if (and (list? j) (pair? j))
-             (map (lambda (o) (if (hash? o) o (hash 'name (em--jstr o)))) j)
-             (list (hash 'name "default" 'method "oauth")))))
-      (else                                         ; legacy "name|method …"
-       (map (lambda (tok)
-              (let ((parts (em--split-char tok #\|)))
-                (hash 'name (car parts)
-                      'method (if (and (pair? (cdr parts)) (not (equal? (car (cdr parts)) "")))
-                                  (car (cdr parts)) "oauth"))))
-            (filter (lambda (t) (not (equal? t "")))
-                    (em--split-char (replace-regexp-in-string "\\s+" " " s) #\space)))))))
+;; Parse the option VALUE into a list of account hashes (split out so it's
+;; testable without the editor's option store).
+(define (em--parse-accounts v)
+  (cond
+    ;; A Scheme list of account hashes (the canonical form).
+    ((and (list? v) (pair? v))
+     (map (lambda (o) (if (hash? o) o (hash 'name (em--jstr o)))) v))
+    ;; A non-empty string → the legacy "name|method …" shorthand.
+    ((and (string? v) (not (equal? (em--trim v) "")))
+     (map (lambda (tok)
+            (let ((parts (em--split-char tok #\|)))
+              (hash 'name (car parts)
+                    'method (if (and (pair? (cdr parts)) (not (equal? (car (cdr parts)) "")))
+                                (car (cdr parts)) "oauth"))))
+          (filter (lambda (t) (not (equal? t "")))
+                  (em--split-char (replace-regexp-in-string "\\s+" " " (em--trim v)) #\space))))
+    ;; Unset / empty → a single "default" account.
+    (else
+     (list (hash 'name "default" 'method (em--knob "email-auth-method" "oauth"))))))
+
+(define (em--accounts) (em--parse-accounts (get-option "email-accounts")))
 
 (define (em--acc-name a) (em--jstr (hash-try-get a 'name)))
 

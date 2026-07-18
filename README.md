@@ -17,23 +17,23 @@ by name.
 ## Configuring a Gmail account
 
 The **`email-accounts`** option is an **array of account configurations** — a
-JSON array of objects, one self-contained config per mailbox. Every field
-except `name` is optional and falls back to the matching global `email-…`
-option, then a default:
+plain Scheme list of hashes, one self-contained config per mailbox. Every
+field except `'name` is optional and falls back to the matching global
+`email-…` option, then a default:
 
 ```scheme
 (package-install "https://codeberg.org/macros-app/email-client"
   'config (lambda ()
             (set-option "email-accounts"
-              (string-append
-               "["
-               "  {\"name\": \"me@gmail.com\", \"method\": \"oauth\","
-               "   \"client-id\": \"…apps.googleusercontent.com\","
-               "   \"client-secret\": \"…\"},"
-               "  {\"name\": \"work@corp.com\", \"method\": \"app-password\","
-               "   \"query\": \"in:inbox OR label:team\"}"
-               "]"))
-            ;; Shared defaults — any account object may override these:
+              (list
+               (hash 'name          "me@gmail.com"
+                     'method        "oauth"
+                     'client-id     "…apps.googleusercontent.com"
+                     'client-secret "…")
+               (hash 'name   "work@corp.com"
+                     'method "app-password"
+                     'query  "in:inbox OR label:team")))
+            ;; Shared defaults — any account hash may override these:
             (set-option "email-query"         "in:inbox") ; REST sync scope
             (set-option "email-name"          "Your Name"); From: display name
             (set-option "email-data-dir"      "~/.macros-email")
@@ -41,17 +41,20 @@ option, then a default:
             (set-option "email-auto-sync-minutes" "5")))  ; unset = manual G only
 ```
 
-Recognized per-account fields (all optional except `name`): `method`,
+Recognized per-account fields (all optional except `'name`): `method`,
 `client-id`, `client-secret`, `query`, `address` (From: address),
 `from-name` (From: display name), `imap-host`, `smtp-host`, `mode`,
 `maildir`, `fetch-count`, `auto-sync-minutes`. Put shared values in the
-global `email-…` options and only the per-mailbox differences in each object.
+global `email-…` options and only the per-mailbox differences in each hash.
 
 The first entry is the default active account; `a` cycles and
 `M-x email-switch-account` prompts by name. A simple setup can still use the
 legacy string form — `"me@gmail.com|oauth work@corp.com|app-password"`. If
 `email-accounts` is unset you get a single account named `default` whose
 method comes from the `email-auth-method` option (default `"oauth"`).
+
+(This works because macros' `set-option` stores structured Scheme values —
+lists and hashes — not just strings, so config stays pure Scheme.)
 
 A few more optional overrides (rarely needed): `email-address` sets the
 `From:` address when it differs from the logged-in account (send-as aliases);
