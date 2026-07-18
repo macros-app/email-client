@@ -16,28 +16,41 @@ by name.
 
 ## Configuring a Gmail account
 
-Every mailbox is one `name|method` entry in the **`email-accounts`** option —
-whitespace-separated, method `oauth` or `app-password`:
+The **`email-accounts`** option is an **array of account configurations** — a
+JSON array of objects, one self-contained config per mailbox. Every field
+except `name` is optional and falls back to the matching global `email-…`
+option, then a default:
 
 ```scheme
 (package-install "https://codeberg.org/macros-app/email-client"
   'config (lambda ()
-            ;; The mailbox list. Each account keeps its own local store and
-            ;; its own keychain credential; `a` in *email* switches.
-            (set-option "email-accounts" "personal|oauth work|app-password")
-            ;; oauth accounts only (ONE GCP client covers all of them):
-            (set-option "email-client-id"     "…apps.googleusercontent.com")
-            (set-option "email-client-secret" "…")
+            (set-option "email-accounts"
+              (string-append
+               "["
+               "  {\"name\": \"me@gmail.com\", \"method\": \"oauth\","
+               "   \"client-id\": \"…apps.googleusercontent.com\","
+               "   \"client-secret\": \"…\"},"
+               "  {\"name\": \"work@corp.com\", \"method\": \"app-password\","
+               "   \"query\": \"in:inbox OR label:team\"}"
+               "]"))
+            ;; Shared defaults — any account object may override these:
             (set-option "email-query"         "in:inbox") ; REST sync scope
-            ;; shared (all optional):
-            (set-option "email-fetch-count"   "100")      ; first-sync page size
             (set-option "email-name"          "Your Name"); From: display name
             (set-option "email-data-dir"      "~/.macros-email")
             (set-option "email-mode"          "live")     ; or "offline" (see below)
             (set-option "email-auto-sync-minutes" "5")))  ; unset = manual G only
 ```
 
-If `email-accounts` is unset you get a single account named `default` whose
+Recognized per-account fields (all optional except `name`): `method`,
+`client-id`, `client-secret`, `query`, `address` (From: address),
+`from-name` (From: display name), `imap-host`, `smtp-host`, `mode`,
+`maildir`, `fetch-count`, `auto-sync-minutes`. Put shared values in the
+global `email-…` options and only the per-mailbox differences in each object.
+
+The first entry is the default active account; `a` cycles and
+`M-x email-switch-account` prompts by name. A simple setup can still use the
+legacy string form — `"me@gmail.com|oauth work@corp.com|app-password"`. If
+`email-accounts` is unset you get a single account named `default` whose
 method comes from the `email-auth-method` option (default `"oauth"`).
 
 A few more optional overrides (rarely needed): `email-address` sets the
@@ -79,20 +92,8 @@ once with the new method's credential.
    every oauth account — you pick which Google account to consent as in the
    browser each time you press `L`.
 
-**Per-account credentials.** If your accounts use *different* GCP clients,
-scope the option to the account name — `email-client-id:<account>` /
-`email-client-secret:<account>` win over the unscoped `email-client-id` for
-that account:
-
-```scheme
-(set-option "email-client-id:me@gmail.com"     "…apps.googleusercontent.com")
-(set-option "email-client-secret:me@gmail.com" "…")
-(set-option "email-client-id:me@work.com"      "…other…apps.googleusercontent.com")
-(set-option "email-client-secret:me@work.com"  "…")
-```
-
-The same `:<account>` suffix also works for `email-query`, so a mailbox can
-have its own sync scope.
+**Different GCP clients per account** just go in each account object's own
+`client-id` / `client-secret` fields (above) — nothing global to set.
 
 Gotchas of Google's making: while the consent screen is in **Testing**
 status, refresh tokens expire after 7 days — push the app to **Production**

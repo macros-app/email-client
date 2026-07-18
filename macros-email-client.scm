@@ -160,33 +160,73 @@
       p))
 
 ;; ── accounts ────────────────────────────────────────────────────────────────
-;; The "email-accounts" option: whitespace-separated "name|method" entries
-;; (method: oauth | app-password). Unset → one account "default" using the
-;; "email-auth-method" option. Each account owns a subdirectory of the data
-;; dir and a keychain credential; ONE account is active at a time (its state
-;; fills *email-state*), and switching saves + swaps the store.
-(define (em--parse-accounts s)       ; → ((name . method-string) …), never '()
-  (let ((toks (filter (lambda (t) (not (equal? t "")))
-                      (em--split-char (replace-regexp-in-string "\\s+" " " (em--trim s))
-                                      #\space))))
-    (if (null? toks)
-        (list (cons "default" (em--knob "email-auth-method" "oauth")))
-        (map (lambda (tok)
-               (let ((parts (em--split-char tok #\|)))
-                 (cons (car parts)
-                       (if (and (pair? (cdr parts)) (not (equal? (car (cdr parts)) "")))
-                           (car (cdr parts))
-                           "oauth"))))
-             toks))))
+;; The "email-accounts" option is an ARRAY OF ACCOUNT CONFIGURATIONS — a JSON
+;; array of objects, one self-contained config per mailbox:
+;;
+;;   [{"name": "me@gmail.com", "method": "oauth",
+;;     "client-id": "…", "client-secret": "…"},
+;;    {"name": "work@corp.com", "method": "app-password", "query": "in:inbox"}]
+;;
+;; Recognized fields (all optional except name): method, client-id,
+;; client-secret, query, address, from-name, imap-host, smtp-host, mode,
+;; maildir, fetch-count, auto-sync-minutes. Any omitted field falls back to the
+;; matching global "email-<field>" option, then a built-in default — so shared
+;; settings stay global and only per-mailbox differences go in the object.
+;;
+;; Still accepted for simple setups: the legacy whitespace-separated
+;; "name|method" string. Unset → one account "default" using
+;; "email-auth-method". Each account owns a data-dir subdirectory and its own
+;; keychain credential; ONE is active at a time, and switching saves + swaps
+;; the store.
+(define (em--accounts)
+  (let ((s (em--trim (em--knob "email-accounts" ""))))
+    (cond
+      ((equal? s "")
+       (list (hash 'name "default" 'method (em--knob "email-auth-method" "oauth"))))
+      ((starts-with? s "[")                         ; JSON array of objects
+       (let ((j (string->jsexpr s)))
+         (if (and (list? j) (pair? j))
+             (map (lambda (o) (if (hash? o) o (hash 'name (em--jstr o)))) j)
+             (list (hash 'name "default" 'method "oauth")))))
+      (else                                         ; legacy "name|method …"
+       (map (lambda (tok)
+              (let ((parts (em--split-char tok #\|)))
+                (hash 'name (car parts)
+                      'method (if (and (pair? (cdr parts)) (not (equal? (car (cdr parts)) "")))
+                                  (car (cdr parts)) "oauth"))))
+            (filter (lambda (t) (not (equal? t "")))
+                    (em--split-char (replace-regexp-in-string "\\s+" " " s) #\space)))))))
 
-(define (em--accounts) (em--parse-accounts (em--knob "email-accounts" "")))
+(define (em--acc-name a) (em--jstr (hash-try-get a 'name)))
 
-;; The active account name (first configured account until a switch).
+;; The active account name (first configured until a switch).
 (define (em--account)
   (or (em--st 'account)
-      (let ((name (car (car (em--accounts)))))
+      (let ((name (em--acc-name (car (em--accounts)))))
         (em--st! 'account name)
         name)))
+
+;; The active account's config object (a bare {name} hash if not found).
+(define (em--account-rec)
+  (let ((name (em--account)))
+    (let loop ((as (em--accounts)))
+      (cond ((null? as) (hash 'name name))
+            ((equal? (em--acc-name (car as)) name) (car as))
+            (else (loop (cdr as)))))))
+
+;; Does an account named `name` exist in the config?
+(define (em--account-exists? name)
+  (let loop ((as (em--accounts)))
+    (cond ((null? as) #f)
+          ((equal? (em--acc-name (car as)) name) #t)
+          (else (loop (cdr as))))))
+
+;; A per-account setting: the active account object's `field` (a non-empty
+;; string), else the global "email-<…>" option, else `fallback`.
+(define (em--acct field global-opt fallback)
+  (let ((v (hash-try-get (em--account-rec) field)))
+    (if (and (string? v) (not (equal? (em--trim v) ""))) v
+        (em--knob global-opt fallback))))
 
 (define (em--data-dir)      (em--expand-home (em--knob "email-data-dir" *email-data-dir*)))
 (define (em--acct-dir)      (path-join (em--data-dir) (em--account)))
@@ -196,28 +236,19 @@
 (define (em--pass-file)     (path-join (em--acct-dir) "app-password"))
 (define (em--messages-dir)  (path-join (em--acct-dir) "messages"))
 (define (em--msg-file id)   (path-join (em--messages-dir) id))
-;; A PER-ACCOUNT knob: the "<base>:<account>" option when set, else the plain
-;; "<base>" option, else `fallback`. Lets accounts that need distinct values
-;; (separate GCP OAuth clients, a different sync query) override the global.
-(define (em--knob-acct base fallback)
-  (em--knob (string-append base ":" (em--account))
-            (em--knob base fallback)))
-
-(define (em--client-id)     (em--trim (em--knob-acct "email-client-id" "")))
-(define (em--client-secret) (em--trim (em--knob-acct "email-client-secret" "")))
-(define (em--query)         (em--knob-acct "email-query" "in:inbox"))
-(define (em--imap-host)     (em--knob "email-imap-host" "imap.gmail.com"))
-(define (em--smtp-host)     (em--knob "email-smtp-host" "smtp.gmail.com"))
+(define (em--client-id)     (em--trim (em--acct 'client-id "email-client-id" "")))
+(define (em--client-secret) (em--trim (em--acct 'client-secret "email-client-secret" "")))
+(define (em--query)         (em--acct 'query "email-query" "in:inbox"))
+(define (em--imap-host)     (em--acct 'imap-host "email-imap-host" "imap.gmail.com"))
+(define (em--smtp-host)     (em--acct 'smtp-host "email-smtp-host" "smtp.gmail.com"))
 (define (em--fetch-count)
-  (let ((n (string->number (em--knob "email-fetch-count" "100"))))
+  (let ((n (string->number (em--acct 'fetch-count "email-fetch-count" "100"))))
     (if (and n (> n 0) (<= n 500)) n 100)))
 
 ;; The ACTIVE ACCOUNT's auth method: 'oauth or 'app-password (an unrecognized
 ;; value falls back to oauth, with the misspelling surfaced).
 (define (em--method)
-  (let* ((raw (or (em--aget (em--accounts) (em--account))
-                  (em--knob "email-auth-method" "oauth")))
-         (m (em--downcase (em--trim raw))))
+  (let ((m (em--downcase (em--trim (em--acct 'method "email-auth-method" "oauth")))))
     (cond ((equal? m "app-password") 'app-password)
           ((equal? m "oauth") 'oauth)
           (else (message (string-append "email: unknown auth method \"" m "\" — using oauth"))
@@ -236,7 +267,7 @@
 ;; search, attachments) stays local, not that nothing ever connects.
 (define (em--mode)
   (or (em--st 'mode)
-      (if (equal? (em--downcase (em--trim (em--knob "email-mode" "live"))) "offline")
+      (if (equal? (em--downcase (em--trim (em--acct 'mode "email-mode" "live"))) "offline")
           'offline 'live)))
 
 (define (em--offline?) (equal? (em--mode) 'offline))
@@ -2604,8 +2635,9 @@
 ;; write it — bcc recipients ride the envelope only. Returns the raw string,
 ;; or #f after messaging about an unreadable attachment.
 (define (em--mime-message p in-reply-to include-bcc?)
-  (let* ((from (let ((addr (em--knob "email-address" (em--st 'me)))
-                     (name (em--knob "email-name" "")))
+  (let* ((from (let ((addr (let ((a (em--acct 'address "email-address" "")))
+                                 (if (equal? a "") (em--st 'me) a)))
+                     (name (em--acct 'from-name "email-name" "")))
                  (cond ((equal? addr "") #f)
                        ((equal? name "") (string-append "From: " addr))
                        (else (string-append "From: " (em--header-word name) " <" addr ">")))))
@@ -3237,7 +3269,7 @@
     ((em--st 'caching) (message "email: cannot switch accounts during the offline cache"))
     ((em--st 'busy)    (message "email: cannot switch accounts while a request is in flight"))
     ((em--st 'auth)    (message "email: cannot switch accounts during a login"))
-    ((not (em--aget (em--accounts) name))
+    ((not (em--account-exists? name))
      (message (string-append "email: no account \"" name
                              "\" — configure the \"email-accounts\" option")))
     ((equal? name (em--account))
@@ -3254,7 +3286,7 @@
 
 ;; M-x email-switch-account — prompt with the configured names.
 (define (email-switch-account)
-  (let ((names (map car (em--accounts))))
+  (let ((names (map em--acc-name (em--accounts))))
     (if (null? (cdr names))
         (message "email: only one account — set the \"email-accounts\" option")
         (read-string
@@ -3265,7 +3297,7 @@
 
 ;; `a` in the list buffer — hop to the next configured account, wrapping.
 (define (email-cycle-account)
-  (let* ((names (map car (em--accounts)))
+  (let* ((names (map em--acc-name (em--accounts)))
          (cur (em--account)))
     (if (null? (cdr names))
         (message "email: only one account — set the \"email-accounts\" option")
@@ -3892,7 +3924,7 @@
 ;; After one full `email-export-maildir` backfill, this is exactly the new
 ;; arrivals of each sync. mu/notmuch pick them up on their next index run.
 (define (em--maildir-auto-dir)
-  (let ((v (em--trim (em--knob "email-maildir" ""))))
+  (let ((v (em--trim (em--acct 'maildir "email-maildir" ""))))
     (if (equal? v "") #f (em--expand-home v))))
 
 ;; Mirror specific ids over IMAP (blocking): each is located in All Mail by
@@ -4188,14 +4220,14 @@
 
 ;; ── auto-sync timer ─────────────────────────────────────────────────────────
 (define (em--arm-timer)
-  (let ((mins (string->number (em--knob "email-auto-sync-minutes" ""))))
+  (let ((mins (string->number (em--acct 'auto-sync-minutes "email-auto-sync-minutes" ""))))
     (when (and mins (> mins 0) (not (em--st 'timer-armed)))
       (em--st! 'timer-armed #t)
       (run-with-timer (* mins 60000) 'email--timer-tick))))
 
 (define (email--timer-tick)
   (em--st! 'timer-armed #f)
-  (let ((mins (string->number (em--knob "email-auto-sync-minutes" ""))))
+  (let ((mins (string->number (em--acct 'auto-sync-minutes "email-auto-sync-minutes" ""))))
     (when (and mins (> mins 0))
       (when (and (em--st 'loaded)
                  (not (em--st 'syncing))
