@@ -3506,28 +3506,46 @@
 (define (em--authinfo-quote s)
   (if (em--contains-space? s) (string-append "\"" s "\"") s))
 
-;; Append (machine login secret) entries to ~/.authinfo, creating it 600 if
-;; missing. An entry whose machine+login already resolve is skipped, so
-;; re-running the wizard never duplicates (or shadows) a line.
+;; Append (machine login secret) entries to the authinfo file, creating a
+;; plaintext ~/.authinfo 600 if none exists. When ~/.authinfo.gpg exists the
+;; append goes THERE — decrypt, extend, re-encrypt to the default key — so an
+;; encrypted setup never sprouts a plaintext sibling. An entry whose
+;; machine+login already resolve is skipped, so re-running the wizard never
+;; duplicates (or shadows) a line.
 (define (em--authinfo-append! entries)
-  (let* ((path (em--expand-home "~/.authinfo"))
-         (existing (if (file-exists? path) (read-file path) ""))
-         (add (filter (lambda (e)
-                        (not (em--authinfo-find-in existing (nth e 0) (nth e 1))))
-                      entries)))
-    (when (pair? add)
-      (write-file
-       path
-       (string-append
-        existing
-        (if (or (equal? existing "") (em--ends-newline? existing)) "" "\n")
-        (apply string-append
-               (map (lambda (e)
-                      (string-append "machine " (nth e 0) " login " (nth e 1)
-                                     " password " (em--authinfo-quote (nth e 2)) "\n"))
-                    add))))
-      (call-process-full "chmod" (list "600" path) ""))
-    (em--st! 'authinfo-cache (hash))))
+  (let* ((gpg-path (em--expand-home "~/.authinfo.gpg"))
+         (use-gpg (file-exists? gpg-path))
+         (path (if use-gpg gpg-path (em--expand-home "~/.authinfo")))
+         (existing (cond (use-gpg (em--authinfo-text "~/.authinfo.gpg"))
+                         ((file-exists? path) (read-file path))
+                         (else ""))))
+    (if (and use-gpg (not (string? existing)))
+        ;; Decrypt failed: writing would clobber the entries we can't read.
+        (message "email: could not decrypt ~/.authinfo.gpg — secrets NOT saved")
+        (let ((add (filter (lambda (e)
+                             (not (em--authinfo-find-in existing (nth e 0) (nth e 1))))
+                           entries)))
+          (when (pair? add)
+            (let ((text (string-append
+                         existing
+                         (if (or (equal? existing "") (em--ends-newline? existing)) "" "\n")
+                         (apply string-append
+                                (map (lambda (e)
+                                       (string-append
+                                        "machine " (nth e 0) " login " (nth e 1)
+                                        " password " (em--authinfo-quote (nth e 2)) "\n"))
+                                     add)))))
+              (if use-gpg
+                  (let ((r (call-process-full
+                            (em--gpg-bin)
+                            (list "--batch" "--yes" "--quiet"
+                                  "--default-recipient-self" "-e" "-o" path)
+                            text)))
+                    (when (not (equal? (car r) "0"))
+                      (message "email: gpg encrypt failed — secrets NOT saved")))
+                  (write-file path text))
+              (call-process-full "chmod" (list "600" path) "")))
+          (em--st! 'authinfo-cache (hash))))))
 
 (define (em--wizard-finish addr method entries)
   (em--authinfo-append! entries)

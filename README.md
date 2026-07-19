@@ -62,9 +62,12 @@ You don't have to edit config at all. `M-x email-add-account` (or `n` in the
 `?` menu) walks you through it: account type (`oauth` / `app-password`) →
 email address → the credentials for that type. When it finishes:
 
-- **Secrets go to `~/.authinfo`** (created `chmod 600` if missing, appended
-  otherwise — lines whose machine+login already resolve are skipped, so
-  re-running never duplicates an entry).
+- **Secrets go to your authinfo file.** If `~/.authinfo.gpg` exists the
+  wizard appends *there* — decrypt, extend, re-encrypt to your default key —
+  so an encrypted setup never sprouts a plaintext sibling. Otherwise a
+  plaintext `~/.authinfo` is created `chmod 600` / appended. Lines whose
+  machine+login already resolve are skipped, so re-running never duplicates
+  an entry.
 - **The account itself goes to `~/.config/macros/email-client.conf`** — a
   plain Scheme file that must evaluate to a list of account hashes:
 
@@ -165,9 +168,11 @@ first match wins.
 
 A path ending in `.gpg` is decrypted by piping through `gpg --decrypt`
 (gpg-agent/pinentry supplies the passphrase — with `pinentry-mac` you get a
-GUI prompt and optional Keychain caching). Encrypting is one command —
-`gpg -e -r you@example.com ~/.authinfo` writes `~/.authinfo.gpg`; delete the
-plaintext after. Plaintext works too — `chmod 600` it. Decrypted text is cached for the session;
+GUI prompt and optional Keychain caching; a passphrase-less key decrypts
+headlessly, which is the friction-free setup for a GUI editor). Encrypting
+is one command — `gpg -e -r you@example.com ~/.authinfo` writes
+`~/.authinfo.gpg`; delete the plaintext after. Plaintext works too —
+`chmod 600` it. Decrypted text is cached for the session;
 `M-x email-reload-authinfo` re-reads after edits.
 
 Note the OAuth **refresh token** (the credential that actually grants
