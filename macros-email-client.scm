@@ -2822,7 +2822,7 @@
 ;; or #f after messaging about an unreadable attachment.
 (define (em--mime-message p in-reply-to include-bcc?)
   (let* ((from (let ((addr (let ((a (em--acct 'address "email-address" "")))
-                                 (if (equal? a "") (em--st 'me) a)))
+                                 (if (equal? a "") (em--jstr (em--st 'me)) a)))
                      (name (em--acct 'from-name "email-name" "")))
                  (cond ((equal? addr "") #f)
                        ((equal? name "") (string-append "From: " addr))
@@ -4393,12 +4393,16 @@
 ;; via the active backend, deleting on success and keeping on failure.
 (define (em--outbox-dir) (path-join (em--acct-dir) "outbox"))
 
+;; Basenames (NOT full paths) of the queued *.eml files — every caller
+;; re-joins with (em--outbox-dir), so returning list-directory's absolute
+;; paths would double the directory and every read would miss.
 (define (em--outbox-files)
   (let ((dir (em--outbox-dir)))
     (if (file-exists? dir)
         (sort-by (lambda (x) x) string<?
-                 (filter (lambda (f) (em--matches? "\\.eml$" f))
-                         (list-directory dir)))
+                 (map basename
+                      (filter (lambda (f) (em--matches? "\\.eml$" f))
+                              (list-directory dir))))
         '())))
 
 (define (em--outbox-count) (length (em--outbox-files)))
