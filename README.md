@@ -250,15 +250,17 @@ the client treats the network:
 |---|---|---|
 | Message bodies | downloaded lazily when you open one | **sync downloads every new body** so the whole inbox reads disconnected |
 | Opening a message | fetches if not cached | local files only — never hits the network |
-| Composing / sending | sent immediately | **queued to the outbox**; sent later with `email-outbox-flush` |
+| Composing / sending | sent immediately | **queued to the outbox**; sent on the next `G` (or `email-outbox-flush`) |
 | Search `s` | server-side Gmail query | redirects to local FTS search |
 | Folders | Sent/All Mail/Trash query the server | those report "needs a connection"; Inbox/Unread/Starred are local |
 
-Offline mode does **not** mean "never connect" — `G` (sync) and flushing the
-outbox are the deliberate network actions. It means the *passive* surface
-(reading, searching, browsing) stays entirely on local files, so the workflow
-is: sync while you have a connection, then read and reply on the plane, then
-`email-outbox-flush` when you land.
+Offline mode does **not** mean "never connect" — `G` (sync) is the deliberate
+network action. It means the *passive* surface (reading, searching, browsing)
+stays entirely on local files, so the workflow is: sync while you have a
+connection, then read and reply on the plane, then `G` when you land — a sync
+also **flushes the outbox** (silently skipped when it's empty), so queued
+replies go out with the same keystroke. `email-outbox-flush` still works to
+send without syncing.
 
 The **outbox** (`O`) lists queued messages; `enter` loads one back into a
 compose buffer to edit, `d` deletes it, `S` (or `email-outbox-flush`) sends

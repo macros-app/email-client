@@ -2177,11 +2177,14 @@
     (em--list-render 'keep))
   (message (string-append "email: sync done — "
                           (number->string (em--st 'new-count)) " new"))
-  ;; Queue the maildir mirror (if configured) and the offline body cache
-  ;; BEFORE releasing this op, so they run immediately after — new arrivals
-  ;; land on disk with the sync.
+  ;; Queue the maildir mirror (if configured), the outbox flush, and the
+  ;; offline body cache BEFORE releasing this op, so they run immediately
+  ;; after — new arrivals land on disk and queued sends go out with the sync.
+  ;; Flush before cache: sends are small and user-visible, the cache can run
+  ;; long.
   (em--auto-export)
   (em--op-done)
+  (em--outbox-autoflush)
   (em--cache-bodies))
 
 ;; Replay pending (id . kind) ops over REST: modify for flags, the trash
@@ -2321,6 +2324,7 @@
           (message (string-append "email: sync done — "
                                   (number->string (em--st 'new-count)) " new"))
           (em--auto-export)
+          (em--outbox-autoflush)
           (em--cache-bodies)))))
 
 (define (em--sync-imap-full conn sel)
@@ -4446,6 +4450,14 @@
 
 ;; `email-outbox-flush` — try to send every queued message. REST is an async
 ;; op chain (advances on each send's callback); IMAP/SMTP is a blocking loop.
+;; After a successful sync we clearly have connectivity — send anything
+;; queued. Silent when the outbox is empty or we're logged out, so it never
+;; clobbers the "sync done" message. This is what empties the offline-mode
+;; outbox on the next G.
+(define (em--outbox-autoflush)
+  (when (and (pair? (em--outbox-files)) (em--logged-in?))
+    (email-outbox-flush)))
+
 (define (email-outbox-flush)
   (let ((files (em--outbox-files)))
     (cond
