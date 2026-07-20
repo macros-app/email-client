@@ -35,7 +35,8 @@
 ;;   M-x email  /  C-c m      open the message list
 ;;
 ;;   in *email* (list):
-;;     enter / click    open the message (marks it read)
+;;     enter            open the message (marks it read; clicks only move
+;;                      the cursor — no accidental opens)
 ;;     C                compose a new message
 ;;     R                reply to the message at point
 ;;     A                archive (remove from inbox)
@@ -4590,7 +4591,9 @@
 
 ;; ── keymaps + registration ──────────────────────────────────────────────────
 (define-key "email-list-mode" "enter"   'email-list-open)
-(define-key "email-list-mode" "mouse-1" 'email-list-open)
+;; Deliberately NO mouse-1 binding in the list: a stray click must never
+;; open (and mark read) a message — clicking just moves the cursor. The
+;; view keeps click-to-follow for links; opening from the list is enter.
 (define-key "email-list-mode" "shift-c" 'email-compose)
 (define-key "email-list-mode" "shift-r" 'email-list-reply)
 (define-key "email-list-mode" "shift-e" 'email-list-reply-all)

@@ -215,7 +215,7 @@ On systems without the `security` CLI they fall back to chmod-600 files
 | *email* (list) | | *email-view* | | *email-compose* | |
 |---|---|---|---|---|---|
 | `?` | **menu (everything)** | `?` | **menu (everything)** | `C-c C-c` | send |
-| `enter` | open | `enter`/click | follow link | `C-c C-k` | discard |
+| `enter` | open (clicks never open) | `enter`/click | follow link | `C-c C-k` | discard |
 | `C` | compose | `n` / `p` | next / prev | `C-c C-a` | attach file |
 | `R` / `E` | reply / reply all | `R` / `E` | reply / reply all | `C-c C-b` | add Bcc |
 | `A` / `D` | archive / trash | `A` / `D` | archive / trash | `C-c C-l` | send later (outbox) |
