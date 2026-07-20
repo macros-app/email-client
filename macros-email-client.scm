@@ -4441,13 +4441,33 @@
         (begin (kill-buffer-named "*email-compose*") #t)
         (begin (message "email: could not write to the outbox") #f))))
 
+;; Best-effort human reason from a Gmail JSON error body, e.g.
+;; {"error":{"code":403,"message":"Request had insufficient …"}} → the
+;; message. Falls back to a truncated raw body so nothing is ever silent.
+(define (em--api-error-msg status body)
+  (let ((m (with-handler
+            (lambda (e) #f)
+            (let ((j (string->jsexpr body)))
+              (and (hash? j)
+                   (let ((err (hash-try-get j 'error)))
+                     (and (hash? err) (em--jstr (hash-try-get err 'message)))))))))
+    (cond
+      ((and (string? m) (not (equal? m ""))) m)
+      ((equal? (em--trim body) "") (string-append "HTTP " (number->string status)))
+      (else (let ((b (em--trim body)))
+              (string-append "HTTP " (number->string status) ": "
+                             (if (> (string-length b) 160) (substring b 0 160) b)))))))
+
 (define (em--flush-done sent failed)
   (when (equal? (current-buffer) "*email-outbox*") (email-outbox))
   (when (equal? (current-buffer) "*email*") (em--list-render 'keep))
-  (message (string-append "email: outbox — " (number->string sent) " sent"
-                          (if (> failed 0)
-                              (string-append ", " (number->string failed) " failed (kept)")
-                              ""))))
+  (let ((err (em--st 'flush-last-err)))
+    (message (string-append "email: outbox — " (number->string sent) " sent"
+                            (if (> failed 0)
+                                (string-append ", " (number->string failed) " failed (kept)"
+                                               (if (and (string? err) (not (equal? err "")))
+                                                   (string-append " — " err) ""))
+                                "")))))
 
 ;; `email-outbox-flush` — try to send every queued message. REST is an async
 ;; op chain (advances on each send's callback); IMAP/SMTP is a blocking loop.
@@ -4460,6 +4480,7 @@
     (email-outbox-flush)))
 
 (define (email-outbox-flush)
+  (em--st! 'flush-last-err "")
   (let ((files (em--outbox-files)))
     (cond
       ((null? files) (message "email: outbox is empty"))
@@ -4476,9 +4497,15 @@
                     (parsed (em--outbox-read path))
                     (p (and parsed (em--parse-compose (nth parsed 2))))
                     (raw (and p (em--mime-message p (nth parsed 0) #f))))
-               (if (and raw (em--smtp-send (em--recipients p) raw))
-                   (begin (delete-file path) (loop (cdr fs) (+ sent 1) failed))
-                   (loop (cdr fs) sent (+ failed 1))))))))))
+               (cond
+                 ((not raw)
+                  (em--st! 'flush-last-err "could not build the message (empty/corrupt outbox file)")
+                  (loop (cdr fs) sent (+ failed 1)))
+                 ((em--smtp-send (em--recipients p) raw)
+                  (delete-file path) (loop (cdr fs) (+ sent 1) failed))
+                 (else
+                  (em--st! 'flush-last-err (string-append "SMTP send failed — " (tls-last-error)))
+                  (loop (cdr fs) sent (+ failed 1)))))))))))
 
 ;; One REST send in the flush chain; recurse on its callback.
 (define (em--flush-next-rest files sent failed)
@@ -4489,7 +4516,8 @@
              (p (and parsed (em--parse-compose (nth parsed 2))))
              (raw (and p (em--mime-message p (nth parsed 0) #t))))
         (if (not raw)
-            (em--flush-next-rest (cdr files) sent (+ failed 1))
+            (begin (em--st! 'flush-last-err "could not build the message (empty/corrupt outbox file)")
+                   (em--flush-next-rest (cdr files) sent (+ failed 1)))
             (em--api "POST" "/gmail/v1/users/me/messages/send"
                      (string-append "{\"raw\":\"" (base64url-encode raw) "\""
                                     (if (equal? (nth parsed 1) "") ""
@@ -4499,7 +4527,8 @@
                        (if (em--2xx? status)
                            (begin (delete-file path)
                                   (em--flush-next-rest (cdr files) (+ sent 1) failed))
-                           (em--flush-next-rest (cdr files) sent (+ failed 1)))))))))
+                           (begin (em--st! 'flush-last-err (em--api-error-msg status body))
+                                  (em--flush-next-rest (cdr files) sent (+ failed 1))))))))))
 
 ;; ── outbox buffer ───────────────────────────────────────────────────────────
 ;; A minimal list of pending messages: enter edits one (loads it back into a
