@@ -114,6 +114,7 @@
    'view-lines   '()     ; rendered lines of *email-view* (link hit-testing)
    'view-links   '()     ; (number . url) alist from the message's link footer
    'current      #f      ; id shown in *email-view*
+   'view-raw     #f      ; #t while *email-view* shows the raw RFC 822 source
    'search-ids   #f      ; ids of the active server search, or #f = inbox view
    'folder       #f      ; display name of the pinned folder/search, #f = inbox
    'ops          '()     ; queued REST op thunks (one http chain at a time)
@@ -131,6 +132,11 @@
    'app-pass     #f
    'pass-loaded  #f      ; keychain consulted for the app password
    'pending-ops  '()     ; (id . kind) flag ops awaiting replay
+   'labels-map   #f      ; REST label name (downcased) → label id, fetched once
+   'contacts     '()     ; (addr name count last-epoch) list, frequency-ranked
+   'contacts-loaded #f   ; contacts file has been read this session
+   'snoozed      '()     ; (id . until-epoch) list, hidden from inbox until due
+   'snoozed-loaded #f    ; snooze file has been read this session
    'mode         #f      ; runtime mode override: #f = use option | 'live | 'offline
    'cacheq       '()     ; ids awaiting eager body download (offline sync)
    'caching      #f      ; an eager-cache pass is in flight
@@ -153,6 +159,14 @@
    'export-quiet #f      ; auto-mirror run: suppress the no-op summary
    'account      #f      ; active account name; #f = first configured
    'timer-armed  #f
+   'threaded     #f      ; #t = group the list by conversation thread
+   'row-ids      (hash)  ; buffer-line → id for the rendered list (point lookup)
+   'search-snippets #f   ; id → FTS snippet excerpt for the active local search
+   'index-quiet  #f      ; suppress index progress/summary (auto-index on sync)
+   'index-db-only #f     ; index only the live db (skip the Maildir scan)
+   'draft-timer  #f      ; compose autosave timer armed
+   'unified      #f      ; #t = merged multi-account view
+   'unified-map  (hash)  ; buffer-line → (account . id) in *email-unified*
    'tz           #f))    ; local UTC offset seconds, computed once
 
 (define (em--st key)    (hash-try-get *email-state* key))
@@ -1593,7 +1607,9 @@
                       (em--st! 'ids (cons (nth f 0) (em--st 'ids))))
                     (em--st! 'db (hash-insert (em--st 'db) (nth f 0) e)))))
               (loop (cdr ls)))))))
-    (em--pending-load)))
+    (em--pending-load)
+    (em--contacts-load)
+    (em--snooze-load)))
 
 (define (em--db-remove id)
   (when (hash-try-get (em--st 'db) id)
@@ -1633,6 +1649,70 @@
                           (filter (lambda (l) (not (equal? l "")))
                                   (em--split-char (read-file (em--pending-file)) #\newline)))))))
 
+;; ── snooze (client-side "remind me later") ──────────────────────────────────
+;; A per-account `snooze` file, one "id␟until-epoch" line per snoozed message.
+;; Snoozed ids are hidden from the inbox view until their time passes, then
+;; reappear automatically (the filter compares against the clock; expired
+;; entries are pruned on load). Purely local — no server state involved.
+(define (em--snooze-file) (path-join (em--acct-dir) "snooze"))
+
+(define (em--snooze-load)
+  (when (not (em--st 'snoozed-loaded))
+    (em--st! 'snoozed-loaded #t)
+    (em--st! 'snoozed
+             (if (not (file-exists? (em--snooze-file)))
+                 '()
+                 (let ((now (em--now)))
+                   (filter (lambda (x) (and x (> (cdr x) now)))   ; drop expired
+                           (map (lambda (line)
+                                  (let ((f (em--split-char line (integer->char 31))))
+                                    (if (>= (length f) 2)
+                                        (cons (nth f 0) (or (string->number (nth f 1)) 0))
+                                        #f)))
+                                (filter (lambda (l) (not (equal? l "")))
+                                        (em--split-char (read-file (em--snooze-file)) #\newline)))))))))
+
+(define (em--snooze-save)
+  (write-file (em--snooze-file)
+              (em--concat
+               (map (lambda (s) (string-append (car s) em--us (number->string (cdr s)) "\n"))
+                    (em--st 'snoozed)))))
+
+;; Snoozed-until epoch for `id`, or #f. Only "still in the future" counts.
+(define (em--snoozed-until id)
+  (let loop ((xs (em--st 'snoozed)))
+    (cond ((null? xs) #f)
+          ((equal? (car (car xs)) id) (cdr (car xs)))
+          (else (loop (cdr xs))))))
+
+(define (em--snoozed? id)
+  (let ((u (em--snoozed-until id)))
+    (and u (> u (em--now)))))
+
+(define (em--snooze-set id until)
+  (em--snooze-load)
+  (em--st! 'snoozed
+           (cons (cons id until)
+                 (filter (lambda (s) (not (equal? (car s) id))) (em--st 'snoozed))))
+  (em--snooze-save))
+
+(define (em--snooze-clear id)
+  (em--snooze-load)
+  (em--st! 'snoozed (filter (lambda (s) (not (equal? (car s) id))) (em--st 'snoozed)))
+  (em--snooze-save))
+
+;; "30m" / "2h" / "1d" / "1w" → seconds, or #f.
+(define (em--parse-duration s)
+  (let ((c (regexp-captures "^([0-9]+)([mhdw])$" (em--trim (em--downcase s)))))
+    (if (null? c)
+        #f
+        (let ((n (or (string->number (nth c 1)) 0)) (u (nth c 2)))
+          (* n (cond ((equal? u "m") 60)
+                     ((equal? u "h") 3600)
+                     ((equal? u "d") 86400)
+                     ((equal? u "w") 604800)
+                     (else 0)))))))
+
 (define (em--queue-op id kind)
   (cond
     ((equal? kind "read")    (em--relabel id '() '("UNREAD")))
@@ -1640,7 +1720,17 @@
     ((equal? kind "star")    (em--relabel id '("STARRED") '()))
     ((equal? kind "unstar")  (em--relabel id '() '("STARRED")))
     ((equal? kind "archive") (em--relabel id '() '("INBOX")))
-    ((equal? kind "trash")   (em--relabel id '("TRASH") '("INBOX"))))
+    ((equal? kind "trash")   (em--relabel id '("TRASH") '("INBOX")))
+    ;; mute — archive AND tag MUTED, so the conversation stays out of the inbox
+    ;; even when it gets a reply (the inbox filter also excludes MUTED).
+    ((equal? kind "mute")    (em--relabel id '("MUTED") '("INBOX")))
+    ;; label+Name / label-Name — arbitrary Gmail label add/remove. Applied
+    ;; locally by name (the display tag shows at once); the next sync replaces
+    ;; the local set with the server's, reconciling name→id.
+    ((em--matches? "^label\\+" kind)
+     (em--relabel id (list (substring kind 6 (string-length kind))) '()))
+    ((em--matches? "^label-" kind)
+     (em--relabel id '() (list (substring kind 6 (string-length kind))))))
   (em--st! 'pending-ops (append (em--st 'pending-ops) (list (cons id kind))))
   (em--pending-save)
   ;; The REST backend can flush immediately (async, nothing blocks); the IMAP
@@ -2172,7 +2262,8 @@
          (known (hash-try-get (em--st 'db) id)))
     (when (not known)
       (em--st! 'ids (cons id (em--st 'ids)))
-      (em--st! 'new-count (+ 1 (em--st 'new-count))))
+      (em--st! 'new-count (+ 1 (em--st 'new-count)))
+      (em--contacts-from-envelope e))
     ;; Keep a REST-era snippet if the IMAP refetch has none.
     (let ((e (if (and known (equal? (hash-try-get e 'snippet) ""))
                  (hash-insert e 'snippet (hash-try-get known 'snippet))
@@ -2253,7 +2344,9 @@
   (em--auto-export)
   (em--op-done)
   (em--outbox-autoflush)
-  (em--cache-bodies))
+  (em--cache-bodies)
+  (em--contacts-save)
+  (em--auto-index))
 
 ;; Replay pending (id . kind) ops over REST: modify for flags, the trash
 ;; endpoint for trash. Transport failure keeps the queue; 4xx drops the op.
@@ -2262,15 +2355,54 @@
     (define (mod add remove)
       (cons (string-append "/gmail/v1/users/me/messages/" id "/modify")
             (string-append "{\"addLabelIds\":[" add "],\"removeLabelIds\":[" remove "]}")))
+    (define (label-json name)   ; display name → the "id" REST wants, if known
+      (string-append "\"" (or (and (em--st 'labels-map)
+                                   (hash-try-get (em--st 'labels-map) (em--downcase name)))
+                              name)
+                     "\""))
     (cond
       ((equal? kind "read")    (mod "" "\"UNREAD\""))
       ((equal? kind "unread")  (mod "\"UNREAD\"" ""))
       ((equal? kind "star")    (mod "\"STARRED\"" ""))
       ((equal? kind "unstar")  (mod "" "\"STARRED\""))
       ((equal? kind "archive") (mod "" "\"INBOX\""))
+      ;; REST can't set the \Muted flag, so mute degrades to an archive here;
+      ;; the IMAP path applies the real mute. Local MUTED tag still hides it.
+      ((equal? kind "mute")    (mod "" "\"INBOX\""))
+      ((em--matches? "^label\\+" kind) (mod (label-json (substring kind 6 (string-length kind))) ""))
+      ((em--matches? "^label-" kind) (mod "" (label-json (substring kind 6 (string-length kind)))))
       (else (cons (string-append "/gmail/v1/users/me/messages/" id "/trash") "{}")))))
 
+;; The account's Gmail labels, name(downcased)→id, fetched once per session so
+;; `label+Name` replay can resolve user labels to the ids REST's modify wants.
+(define (em--ensure-labels k)
+  (if (or (em--st 'labels-map) (not (em--oauth?)))
+      (k)
+      (em--api "GET" "/gmail/v1/users/me/labels" ""
+               (lambda (status body)
+                 (when (em--2xx? status)
+                   (let loop ((xs (em--as-list (em--j (string->jsexpr body) 'labels)))
+                              (h (hash)))
+                     (if (null? xs)
+                         (em--st! 'labels-map h)
+                         (loop (cdr xs)
+                               (hash-insert h (em--downcase (em--jstr (em--j (car xs) 'name)))
+                                            (em--jstr (em--j (car xs) 'id)))))))
+                 (k)))))
+
+;; True when any queued op is a label op (so replay knows to resolve names).
+(define (em--pending-has-label?)
+  (let loop ((ops (em--st 'pending-ops)))
+    (cond ((null? ops) #f)
+          ((em--matches? "^label[+-]" (cdr (car ops))) #t)
+          (else (loop (cdr ops))))))
+
 (define (em--replay-ops-rest k)
+  (if (em--pending-has-label?)
+      (em--ensure-labels (lambda () (em--replay-ops-rest-1 k)))
+      (em--replay-ops-rest-1 k)))
+
+(define (em--replay-ops-rest-1 k)
   (let ((ops (em--st 'pending-ops)))
     (if (null? ops)
         (k)
@@ -2282,7 +2414,7 @@
                        (else
                         (em--st! 'pending-ops (cdr (em--st 'pending-ops)))
                         (em--pending-save)
-                        (em--replay-ops-rest k)))))))))
+                        (em--replay-ops-rest-1 k)))))))))
 
 (define (em--sync-rest-full)
   (em--api "GET"
@@ -2393,7 +2525,9 @@
                                   (number->string (em--st 'new-count)) " new"))
           (em--auto-export)
           (em--outbox-autoflush)
-          (em--cache-bodies)))))
+          (em--cache-bodies)
+          (em--contacts-save)
+          (em--auto-index)))))
 
 (define (em--sync-imap-full conn sel)
   (let* ((exists (hash-try-get sel 'exists))
@@ -2465,7 +2599,20 @@
                     (em--imap-cmd conn (string-append "UID STORE " u " -X-GM-LABELS (\\Inbox)")))
                    ((equal? kind "trash")
                     (em--imap-cmd conn (string-append "UID MOVE " u " "
-                                                      (em--imap-quote em--trash-box)))))))))
+                                                      (em--imap-quote em--trash-box))))
+                   ;; True Gmail mute: set \Muted and drop it from the inbox.
+                   ((equal? kind "mute")
+                    (em--imap-cmd conn (string-append "UID STORE " u " +X-GM-LABELS (\\Muted)"))
+                    (em--imap-cmd conn (string-append "UID STORE " u " -X-GM-LABELS (\\Inbox)")))
+                   ;; X-GM-LABELS takes the label's DISPLAY NAME directly.
+                   ((em--matches? "^label\\+" kind)
+                    (em--imap-cmd conn (string-append
+                                        "UID STORE " u " +X-GM-LABELS ("
+                                        (em--imap-quote (substring kind 6 (string-length kind))) ")")))
+                   ((em--matches? "^label-" kind)
+                    (em--imap-cmd conn (string-append
+                                        "UID STORE " u " -X-GM-LABELS ("
+                                        (em--imap-quote (substring kind 6 (string-length kind))) ")"))))))))
          ops)
         (em--st! 'pending-ops '())
         (em--pending-save)))))
@@ -2567,10 +2714,10 @@
 
 ;; ── list buffer ─────────────────────────────────────────────────────────────
 (define em--list-help
-  "  ? menu · enter open · C compose · R/E reply/all · A archive · D trash · U unread · * star · f folders · i inbox · s// search · a account · g/G refresh/sync · L login · q quit")
+  "  ? menu · enter open · C compose · R/E reply/all · A archive · D trash · U unread · * star · l label · m mute · z snooze · T thread · f folders · b saved · i inbox · s// search · a account · g/G refresh/sync · L login · q quit")
 
 (define em--hidden-labels
-  '("INBOX" "UNREAD" "STARRED" "IMPORTANT" "SENT" "DRAFT"
+  '("INBOX" "UNREAD" "STARRED" "IMPORTANT" "SENT" "DRAFT" "MUTED"
     "CATEGORY_PERSONAL" "CATEGORY_SOCIAL" "CATEGORY_PROMOTIONS"
     "CATEGORY_UPDATES" "CATEGORY_FORUMS"))
 
@@ -2588,7 +2735,9 @@
                            (let ((e (hash-try-get db id)))
                              (and e
                                   (member "INBOX" (hash-try-get e 'labels))
-                                  (not (member "TRASH" (hash-try-get e 'labels))))))
+                                  (not (member "TRASH" (hash-try-get e 'labels)))
+                                  (not (member "MUTED" (hash-try-get e 'labels)))
+                                  (not (em--snoozed? id)))))
                          (em--st 'ids))))))
 
 (define (em--ensure-faces) (set-face-bold "email-unread" #t))
@@ -2607,9 +2756,20 @@
 ;; Render *email*. `where` — 'top, 'keep, or a line number (feeds semantics).
 (define (em--list-render where)
   (let* ((prev-line (buffer-line))
-         (ids (em--visible-ids))
+         (flat-ids (em--visible-ids))
          (db (em--st 'db))
-         (header (string-append "Email — " (number->string (length ids)) " messages"
+         (threaded? (em--st 'threaded))
+         (snips (em--st 'search-snippets))
+         (entries (if threaded?
+                      (em--group-threads flat-ids db)
+                      (map (lambda (id)
+                             (let ((e (hash-try-get db id)))
+                               (list id 1
+                                     (and e (member "UNREAD" (hash-try-get e 'labels)) #t))))
+                           flat-ids)))
+         (ids (map car entries))
+         (header (string-append "Email — " (number->string (length entries))
+                                (if threaded? " threads" " messages")
                                 (if (pair? (cdr (em--accounts)))
                                     (string-append " — [" (em--account) "]")
                                     "")
@@ -2633,14 +2793,16 @@
                                 (if (em--st 'syncing) " — syncing…" "")))
          (already? (equal? (current-buffer) "*email*")))
     (em--st! 'view ids)
-    (let loop ((rest ids) (idx 3)
+    (let loop ((rest entries) (idx 3)
                (abs (+ (em--bytelen header) 1 (em--bytelen em--list-help) 1 1))
                (texts (list "" em--list-help header))
                (faces (list (list 0 "keyword") (list 1 "comment")))
-               (ospans '()))
+               (ospans '())
+               (rowmap (hash)))
       (if (null? rest)
           (begin
             (em--ensure-faces)
+            (em--st! 'row-ids rowmap)
             ((if already? render-buffer-quiet render-buffer)
              "*email*" "email-list-mode"
              (em--join (reverse texts) "\n") (reverse faces))
@@ -2649,13 +2811,18 @@
             (goto-line (cond ((and (equal? where 'keep) already? (>= prev-line 3)) prev-line)
                              ((number? where) where)
                              (else 3))))
-          (let* ((e (hash-try-get db (car rest)))
+          (let* ((entry (car rest))
+                 (id (car entry))
+                 (count (nth entry 1))
+                 (unread? (nth entry 2))
+                 (e (hash-try-get db id))
                  (labels (hash-try-get e 'labels))
-                 (unread? (member "UNREAD" labels))
                  (datef (em--date16 (hash-try-get e 'date)))          ; 16 ASCII bytes
                  (starf (if (member "STARRED" labels) "* " "  "))     ; 2 ASCII bytes
                  (fromf (em--fit (em--from-name (hash-try-get e 'from)) *email-from-width*))
-                 (subjf (em--truncate (hash-try-get e 'subject) *email-subject-width*))
+                 (countf (if (> count 1) (string-append " (" (number->string count) ")") ""))
+                 (subjf (em--truncate (string-append (hash-try-get e 'subject) countf)
+                                      *email-subject-width*))
                  (tagsf (em--labels-suffix labels))
                  (line (string-append datef "  " starf fromf "  " subjf
                                       (if (equal? tagsf "") "" "  ") tagsf))
@@ -2668,21 +2835,60 @@
                              ospans
                              (let ((tstart (+ from-end 2 (em--bytelen subjf) 2)))
                                (cons (list tstart (+ tstart (em--bytelen tagsf)) "keyword")
-                                     ospans)))))
-            (loop (cdr rest) (+ idx 1) (+ abs (em--bytelen line) 1)
-                  (cons line texts) faces ospans))))))
+                                     ospans))))
+                 (rowmap (hash-insert rowmap idx id))
+                 (texts (cons line texts))
+                 (idx1 (+ idx 1))
+                 (abs1 (+ abs (em--bytelen line) 1))
+                 ;; A local-search hit carries an FTS excerpt: emit it as a dim
+                 ;; continuation line, mapped to the same id so open/reply work.
+                 (snip (and snips (hash-try-get snips id))))
+            (if (and (string? snip) (not (equal? (em--trim snip) "")))
+                (let* ((sline (string-append "        "
+                                             (em--truncate (em--sanitize snip) 88)))
+                       (faces (cons (list idx1 "comment") faces))
+                       (rowmap (hash-insert rowmap idx1 id))
+                       (texts (cons sline texts)))
+                  (loop (cdr rest) (+ idx1 1) (+ abs1 (em--bytelen sline) 1)
+                        texts faces ospans rowmap))
+                (loop (cdr rest) idx1 abs1 texts faces ospans rowmap)))))))
 
+;; The id on the current line, via the line→id map the renderer builds. Robust
+;; to variable per-entry heights (threaded groups, snippet lines) — the old
+;; fixed `line - offset` arithmetic assumed exactly one line per message.
 (define (em--id-at-point)
-  (let* ((line (buffer-line))
-         (idx (- line (em--st 'view-offset)))
-         (view (em--st 'view)))
-    (if (and (>= idx 0) (< idx (length view)))
-        (nth view idx)
-        #f)))
+  (hash-try-get (em--st 'row-ids) (buffer-line)))
+
+;; Group a date-sorted id list into conversations: keep the newest message of
+;; each thread as the representative, with the thread's member count and a flag
+;; for "any member unread". Returns a list of (rep-id count any-unread?), still
+;; newest-thread-first (the rep's date drives order, since ids arrive sorted).
+(define (em--group-threads ids db)
+  (let loop ((xs ids) (seen (hash)) (order '())
+             (counts (hash)) (unread (hash)))
+    (if (null? xs)
+        (map (lambda (pair)
+               (let ((tid (car pair)) (id (cdr pair)))
+                 (list id (hash-try-get counts tid)
+                       (hash-try-get unread tid))))
+             (reverse order))
+        (let* ((id (car xs))
+               (e (hash-try-get db id))
+               (tid0 (and e (hash-try-get e 'thread)))
+               (tid (if (or (not tid0) (equal? tid0 "")) id tid0))
+               (unread? (and e (member "UNREAD" (hash-try-get e 'labels)) #t)))
+          (if (hash-try-get seen tid)
+              (loop (cdr xs) seen order
+                    (hash-insert counts tid (+ 1 (hash-try-get counts tid)))
+                    (if unread? (hash-insert unread tid #t) unread))
+              (loop (cdr xs) (hash-insert seen tid #t)
+                    (cons (cons tid id) order)
+                    (hash-insert counts tid 1)
+                    (hash-insert unread tid unread?)))))))
 
 ;; ── view buffer ─────────────────────────────────────────────────────────────
 (define em--view-help
-  "  ? menu · enter follow link · n/p next/prev · R/E reply/all · A archive · D trash · W save attachment · b gmail · q back")
+  "  ? menu · enter follow link · n/p next/prev · R/E reply/all · A archive · D trash · W save attachment · \\ raw · b gmail · q back")
 
 ;; Read the normalized store file → (head-lines body-lines attachments).
 (define (em--read-message id)
@@ -2711,6 +2917,7 @@
   (let ((msg (em--read-message id)))
     (when msg
       (em--st! 'current id)
+      (em--st! 'view-raw #f)   ; rendering the reader view leaves raw mode
       (em--st! 'view-atts (nth msg 2))
       (let* ((head (nth msg 0))
              (atts (nth msg 2))
@@ -2799,14 +3006,71 @@
   (kill-buffer-named "*email-compose*")
   (append-to-buffer "*email-compose*"
                     (string-append "To: " to "\nCc: " cc "\nSubject: " subject "\n"
-                                   em--separator "\n" body))
+                                   em--separator "\n" (em--compose-body body)))
   (set-major-mode "email-compose-mode")
   (buffer-local-set "email-in-reply-to" in-reply-to)
   (buffer-local-set "email-thread-id" thread-id)
   (goto-char 4)
+  (em--draft-arm)
   (message "email: compose — C-c C-c send · C-c C-k discard · C-c C-a attach · C-c C-b bcc · M-i complete address"))
 
-(define (email-compose) (em--compose "" "" "" "" "" ""))
+;; A blank compose recovers an autosaved draft if one is waiting.
+(define (email-compose)
+  (em--load)
+  (if (file-exists? (em--draft-file))
+      (em--compose-recover)
+      (em--compose "" "" "" "" "" "")))
+
+;; ── draft autosave ──────────────────────────────────────────────────────────
+;; While composing, the buffer is periodically written to <account>/drafts/
+;; draft.eml (compose text + threading pseudo-headers, the outbox format) so a
+;; crash or accidental quit never loses an in-progress message. The draft is
+;; recovered by the next blank `C` and cleared once the message is sent,
+;; queued, or explicitly discarded.
+(define (em--drafts-dir) (path-join (em--acct-dir) "drafts"))
+(define (em--draft-file) (path-join (em--drafts-dir) "draft.eml"))
+
+(define (em--draft-save)
+  (when (equal? (current-buffer) "*email-compose*")
+    (let ((body (buffer-string)))
+      (when (and (string? body) (em--matches? em--separator body))
+        (write-file (em--draft-file)
+                    (string-append
+                     "X-Macros-In-Reply-To: " (or (buffer-local-get "email-in-reply-to") "") "\n"
+                     "X-Macros-Thread-Id: " (or (buffer-local-get "email-thread-id") "") "\n"
+                     body))))))
+
+(define (em--draft-clear)
+  (when (file-exists? (em--draft-file)) (delete-file (em--draft-file))))
+
+;; Arm the recurring autosave; re-armed on each tick while the compose buffer
+;; stays current, so it quiesces once you leave compose.
+(define (em--draft-arm)
+  (when (not (em--st 'draft-timer))
+    (em--st! 'draft-timer #t)
+    (run-with-timer 15000 'email--draft-tick)))
+
+(define (email--draft-tick)
+  (em--st! 'draft-timer #f)
+  (when (equal? (current-buffer) "*email-compose*")
+    (em--draft-save)
+    (em--draft-arm)))
+
+;; Reload the autosaved draft into a compose buffer (reusing the outbox
+;; parser for the pseudo-headers), and keep autosaving it.
+(define (em--compose-recover)
+  (let ((parsed (em--outbox-read (em--draft-file))))
+    (if (not parsed)
+        (em--compose "" "" "" "" "" "")
+        (begin
+          (kill-buffer-named "*email-compose*")
+          (append-to-buffer "*email-compose*" (nth parsed 2))
+          (set-major-mode "email-compose-mode")
+          (buffer-local-set "email-in-reply-to" (nth parsed 0))
+          (buffer-local-set "email-thread-id" (nth parsed 1))
+          (goto-char 4)
+          (em--draft-arm)
+          (message "email: recovered an unsent draft — C-c C-k discards it")))))
 
 ;; The value of the head line starting with `prefix` ("To: " …), or "".
 (define (em--head-value head prefix)
@@ -2862,6 +3126,24 @@
                      (hash-try-get e 'msgid) (hash-try-get e 'thread))))))
 
 ;; Parse the compose buffer → hash, or #f when the separator is missing.
+;; ── signatures ──────────────────────────────────────────────────────────────
+;; The per-account "email-signature" option (or a global one) is appended to a
+;; fresh compose/reply body under the conventional "-- " delimiter. A literal
+;; "\n" in the option becomes a newline, so a multi-line signature fits on one
+;; config line. Empty → nothing added. Recovered drafts skip this (they already
+;; contain whatever signature was there).
+(define (em--signature)
+  (let ((s (em--acct 'signature "email-signature" "")))
+    (if (equal? (em--trim s) "")
+        ""
+        (replace-regexp-in-string "\\\\n" "\n" s))))
+
+(define (em--compose-body body)
+  (let ((sig (em--signature)))
+    (if (equal? sig "")
+        body
+        (string-append body "\n\n-- \n" sig))))
+
 (define (em--parse-compose text)
   (let loop ((ls (em--split-char text #\newline))
              (to "") (cc "") (bcc "") (subject "") (attach '()))
@@ -3005,6 +3287,8 @@
     (cond
       ((not p) (message "email: separator line missing — is this a compose buffer?"))
       ((equal? (em--trim (hash-try-get p 'to)) "") (message "email: To is empty"))
+      ;; Learn the recipients as contacts (regardless of transport outcome).
+      ((begin (em--bump-recipients p) #f) #f)
       ;; Offline mode: don't attempt the network — queue for a later flush.
       ((em--offline?)
        (when (em--queue-to-outbox)
@@ -3027,6 +3311,7 @@
                          (cond
                            ((em--2xx? status)
                             (kill-buffer-named "*email-compose*")
+                            (em--draft-clear)
                             (message "email: sent"))
                            ;; Transport failure (0) → keep the text: queue it
                            ;; rather than lose it to a dropped connection.
@@ -3045,6 +3330,7 @@
            (message "email: sending …")
            (if (em--smtp-send (em--recipients p) raw)
                (begin (kill-buffer-named "*email-compose*")
+                      (em--draft-clear)
                       (message "email: sent"))
                ;; SMTP failed (likely offline) — queue instead of losing it.
                (if (em--queue-to-outbox)
@@ -3053,6 +3339,7 @@
 
 (define (email-compose-cancel)
   (kill-buffer-named "*email-compose*")
+  (em--draft-clear)
   (message "email: compose discarded"))
 
 ;; Send later — queue into the outbox even in live mode, to send on the next
@@ -3103,9 +3390,90 @@
               (insert "Bcc: \n")
               (goto-char (+ off 5)))))))
 
-;; Every address seen in the account's envelopes (from + to fields), newest
-;; first, deduped — the autocomplete source for To/Cc/Bcc.
+;; ── persisted contacts (frequency-ranked address book) ──────────────────────
+;; A per-account `contacts` file, one line per correspondent —
+;; addr␟name␟count␟last-epoch. Counts accrue as mail is synced (senders weight
+;; more than recipients) and as you send (recipients weight most), so the
+;; completion list ranks the people you actually correspond with to the top.
+(define (em--contacts-file) (path-join (em--acct-dir) "contacts"))
+
+(define (em--contacts-load)
+  (when (not (em--st 'contacts-loaded))
+    (em--st! 'contacts-loaded #t)
+    (em--st! 'contacts
+             (if (not (file-exists? (em--contacts-file)))
+                 '()
+                 (filter (lambda (x) x)
+                         (map (lambda (line)
+                                (let ((f (em--split-char line (integer->char 31))))
+                                  (if (>= (length f) 4)
+                                      (list (nth f 0) (nth f 1)
+                                            (or (string->number (nth f 2)) 0)
+                                            (or (string->number (nth f 3)) 0))
+                                      #f)))
+                              (filter (lambda (l) (not (equal? l "")))
+                                      (em--split-char (read-file (em--contacts-file)) #\newline))))))))
+
+(define (em--contacts-save)
+  (write-file (em--contacts-file)
+              (em--concat
+               (map (lambda (c)
+                      (string-append (nth c 0) em--us (nth c 1) em--us
+                                     (number->string (nth c 2)) em--us
+                                     (number->string (nth c 3)) "\n"))
+                    (em--st 'contacts)))))
+
+;; Fold one raw address field ("Kim <kim@x>") into the contacts list: extract
+;; the address + display name, add `weight` to its count, keep the newest
+;; last-seen. Junk (no @, contains <>/space) is ignored.
+(define (em--contact-bump raw weight epoch)
+  (let ((addr (em--downcase (em--address-of raw)))
+        (name (em--from-name raw)))
+    (when (and (not (equal? addr ""))
+               (em--matches? "@" addr)
+               (not (em--matches? "[<> ]" addr)))
+      (em--st! 'contacts
+               (let loop ((cs (em--st 'contacts)) (found #f) (out '()))
+                 (cond
+                   ((null? cs)
+                    (reverse (if found out (cons (list addr name weight epoch) out))))
+                   ((equal? (car (car cs)) addr)
+                    (let* ((c (car cs))
+                           (nm (if (equal? name "") (nth c 1) name)))
+                      (loop (cdr cs) #t
+                            (cons (list addr nm (+ (nth c 2) weight)
+                                        (if (> (nth c 3) epoch) (nth c 3) epoch))
+                                  out))))
+                   (else (loop (cdr cs) found (cons (car cs) out)))))))))
+
+;; Bump the sender (strong) + recipients (weak) of a freshly-synced envelope.
+(define (em--contacts-from-envelope e)
+  (let ((date (hash-try-get e 'date)))
+    (em--contact-bump (hash-try-get e 'from) 2 date)
+    (for-each (lambda (t) (em--contact-bump t 1 date))
+              (em--split-char (or (hash-try-get e 'to) "") #\,))))
+
+;; Bump every recipient of a message you're sending (strongest signal).
+(define (em--bump-recipients p)
+  (em--contacts-load)
+  (for-each (lambda (t) (em--contact-bump t 3 (em--now)))
+            (append (em--split-char (hash-try-get p 'to) #\,)
+                    (em--split-char (hash-try-get p 'cc) #\,)
+                    (em--split-char (hash-try-get p 'bcc) #\,)))
+  (em--contacts-save))
+
+;; The completion source: contact addresses ranked by count (desc), falling
+;; back to a live envelope scan until the contacts file has been built.
 (define (em--address-book)
+  (em--contacts-load)
+  (let ((cs (em--st 'contacts)))
+    (if (null? cs)
+        (em--address-book-scan)
+        (map car (sort-by (lambda (c) (nth c 2)) > cs)))))
+
+;; Every address seen in the account's envelopes (from + to fields), newest
+;; first, deduped — the fallback autocomplete source before contacts exist.
+(define (em--address-book-scan)
   (let loop ((ids (em--st 'ids)) (seen '()) (out '()))
     (if (null? ids)
         (reverse out)
@@ -3247,10 +3615,12 @@
 (define (em--goto-inbox)
   (em--st! 'search-ids #f)
   (em--st! 'folder #f)
+  (em--st! 'search-snippets #f)
   (em--list-render 'top))
 
 ;; Run query `q`, pinning the result view under `label` (the header name).
 (define (em--do-search q label)
+  (em--st! 'search-snippets #f)
   (cond
     ((em--oauth?)
      (em--run-op
@@ -3338,6 +3708,7 @@
 ;; `name`. No network — works offline and instantly, for the folders that are
 ;; pure label filters (Unread, Starred).
 (define (em--local-folder label name)
+  (em--st! 'search-snippets #f)
   (em--st! 'search-ids
            (filter (lambda (id)
                      (let ((e (hash-try-get (em--st 'db) id)))
@@ -3362,6 +3733,64 @@
 (define (email-folder-all)     (em--server-folder "-in:spam -in:trash" "All Mail"))
 (define (email-folder-trash)   (em--server-folder "in:trash" "Trash"))
 
+;; A local pin of currently-snoozed messages (Z there wakes one).
+(define (email-folder-snoozed)
+  (em--snooze-load)
+  (em--st! 'search-snippets #f)
+  (em--st! 'search-ids (filter (lambda (id) (hash-try-get (em--st 'db) id))
+                               (map car (em--st 'snoozed))))
+  (em--st! 'folder "Snoozed")
+  (em--list-render 'top)
+  (message (string-append "email: Snoozed — "
+                          (number->string (length (em--st 'search-ids))) " messages")))
+
+;; ── saved searches (bookmarks) ──────────────────────────────────────────────
+;; The "email-bookmarks" option is a list of named Gmail queries — either
+;; hashes or (name . query) pairs:
+;;   (set-option "email-bookmarks"
+;;     (list (hash 'name "Unpaid" 'query "label:invoices -label:paid")
+;;           (hash 'name "From team" 'query "from:team@corp.com newer_than:7d")))
+;; `email-bookmarks` (folder popup `b`, or the ? menu) prompts by name and pins
+;; the query as a folder view — the same mechanism as `s` server search.
+(define (em--bookmarks)
+  (let ((v (get-option "email-bookmarks")))
+    (if (and (list? v) (pair? v))
+        (filter (lambda (b) b)
+                (map (lambda (o)
+                       (cond
+                         ((hash? o)
+                          (let ((n (em--jstr (hash-try-get o 'name)))
+                                (q (em--jstr (hash-try-get o 'query))))
+                            (if (or (equal? n "") (equal? q "")) #f (cons n q))))
+                         ((and (pair? o) (string? (car o)) (string? (cdr o))) o)
+                         (else #f)))
+                     v))
+        '())))
+
+(define (em--bm-find name bms)
+  (cond ((null? bms) #f)
+        ((equal? (car (car bms)) name) (car bms))
+        (else (em--bm-find name (cdr bms)))))
+
+(define (em--run-bookmark name query)
+  (if (em--offline?)
+      (message (string-append "email: \"" name "\" needs a connection (offline mode)"))
+      (em--do-search query (string-append "★ " name))))
+
+(define (email-bookmarks)
+  (let ((bms (em--bookmarks)))
+    (if (null? bms)
+        (message "email: no saved searches — set the \"email-bookmarks\" option (see README)")
+        (read-string
+         (string-append "Saved search (" (em--join (map car bms) " / ") "): ")
+         (lambda (input)
+           (let* ((name (em--trim input))
+                  (hit (em--bm-find name bms)))
+             (cond
+               ((equal? name "") #f)
+               (hit (em--run-bookmark (car hit) (cdr hit)))
+               (else (message (string-append "email: no saved search named " name))))))))))
+
 ;; `?` — the everything menu: every command in the package, grouped, so no
 ;; keybinding has to be remembered. One per mode (list / view).
 (define (email-menu)
@@ -3375,25 +3804,35 @@
                          (list "A" "Archive"       'email-list-archive)
                          (list "D" "Trash"         'email-list-trash)
                          (list "U" "Toggle unread" 'email-list-toggle-unread)
-                         (list "*" "Toggle star"   'email-list-toggle-star))
+                         (list "*" "Toggle star"   'email-list-toggle-star)
+                         (list "l" "Label +/-…"    'email-list-label)
+                         (list "m" "Mute"          'email-list-mute)
+                         (list "z" "Snooze…"       'email-list-snooze)
+                         (list "Z" "Unsnooze"      'email-list-unsnooze))
                    (list "View"
                          (list "f" "Folders…"      'email-folders)
                          (list "i" "Inbox"         'email-folder-inbox)
+                         (list "N" "Snoozed"       'email-folder-snoozed)
+                         (list "T" "Toggle threading" 'email-toggle-thread)
                          (list "s" "Server search…" 'email-list-search)
                          (list "/" "Local search…" 'email-search-local)
+                         (list "b" "Saved searches…" 'email-bookmarks)
                          (list "g" "Refresh"       'email-list-refresh)
-                         (list "G" "Sync"          'email-sync))
+                         (list "G" "Sync"          'email-sync)
+                         (list "t" "Running tasks" 'email-status))
                    (list "Account"
                          (list "a" "Next account"  'email-cycle-account)
                          (list "w" "Switch account…" 'email-switch-account)
                          (list "n" "New account…"  'email-add-account)
+                         (list "u" "Unified inbox" 'email-unified)
+                         (list "c" "Contacts"      'email-contacts)
                          (list "L" "Log in"        'email-login))
                    (list "Offline"
                          (list "O" "Outbox"        'email-outbox)
                          (list "F" "Flush outbox"  'email-outbox-flush)
                          (list "M" "Toggle live/offline" 'email-toggle-mode))
                    (list "Archive"
-                         (list "m" "Export Maildir…" 'email-export-maildir)
+                         (list "e" "Export Maildir…" 'email-export-maildir)
                          (list "x" "Rebuild index" 'email-index)
                          (list "q" "Quit"          'email-list-quit)))))
 
@@ -3408,7 +3847,9 @@
                          (list "b" "Open in Gmail" 'email-view-browse))
                    (list "Flags"
                          (list "A" "Archive"       'email-view-archive)
-                         (list "D" "Trash"         'email-view-trash))
+                         (list "D" "Trash"         'email-view-trash)
+                         (list "L" "Label +/-…"    'email-view-label)
+                         (list "m" "Mute"          'email-view-mute))
                    (list "Attachments"
                          (list "W" "Save attachment…" 'email-view-save-attachment))
                    (list "Patch / git"
@@ -3417,6 +3858,8 @@
                          (list "z" "git am --abort"   'email-view-git-am-abort)
                          (list "P" "Save .patch…"     'email-view-save-patch))
                    (list "Other"
+                         (list "\\" "Toggle raw source" 'email-view-raw)
+                         (list "t" "Running tasks"  'email-status)
                          (list "U" "Toggle unread"  'email-view-toggle-unread)
                          (list "q" "Back to list"   'email-view-quit)))))
 
@@ -3441,12 +3884,14 @@
                          (list "i" "Inbox (local)" 'email-folder-inbox)
                          (list "u" "Unread"        'email-folder-unread)
                          (list "*" "Starred"       'email-folder-starred)
+                         (list "n" "Snoozed"       'email-folder-snoozed)
                          (list "t" "Sent"          'email-folder-sent)
                          (list "l" "All Mail"      'email-folder-all)
                          (list "d" "Trash"         'email-folder-trash))
                    (list "Search"
                          (list "s" "Server search…" 'email-list-search)
                          (list "/" "Local search…"  'email-search-local)
+                         (list "b" "Saved searches…" 'email-bookmarks)
                          (list "x" "Rebuild index"  'email-index))
                    (list "Offline"
                          (list "O" "Outbox"         'email-outbox)
@@ -3456,6 +3901,9 @@
 ;; ── commands ────────────────────────────────────────────────────────────────
 (define (email)
   (em--load)
+  (when (and (not (em--st 'threaded))
+             (equal? (em--acct 'threaded "email-threaded" "") "true"))
+    (em--st! 'threaded #t))
   (em--list-render 'top)
   (em--arm-timer)
   (when (null? (em--st 'ids))
@@ -3510,6 +3958,9 @@
          (cons 'history-id "") (cons 'uid-validity "") (cons 'max-uid 0)
          (cons 'me "") (cons 'view '()) (cons 'view-atts '())
          (cons 'current #f) (cons 'search-ids #f) (cons 'folder #f) (cons 'fetchq '())
+         (cons 'search-snippets #f) (cons 'row-ids (hash)) (cons 'labels-map #f)
+         (cons 'contacts '()) (cons 'contacts-loaded #f)
+         (cons 'snoozed '()) (cons 'snoozed-loaded #f)
          (cons 'new-count 0) (cons 'pending-ops '())
          (cons 'cacheq '()) (cons 'caching #f) (cons 'outbox-files '())
          (cons 'access-token #f) (cons 'token-expiry 0)
@@ -3524,7 +3975,8 @@
 
 (define em--conf-fields
   (list 'name 'method 'query 'address 'from-name 'imap-host 'smtp-host 'mode
-        'maildir 'fetch-count 'auto-sync-minutes 'authinfo 'client-id 'client-secret))
+        'maildir 'fetch-count 'auto-sync-minutes 'signature 'threaded
+        'authinfo 'client-id 'client-secret))
 
 (define (em--conf-escape s)
   (list->string
@@ -3739,6 +4191,36 @@
 
 (define (email-list-archive) (em--list-act (lambda (id) (em--queue-op id "archive"))))
 (define (email-list-trash)   (em--list-act (lambda (id) (em--queue-op id "trash"))))
+(define (email-list-mute)    (em--list-act (lambda (id) (em--queue-op id "mute"))))
+
+;; `z` — snooze the message at point out of the inbox for a duration; it
+;; reappears automatically when the time passes.
+(define (email-list-snooze)
+  (let ((id (em--id-at-point)) (line (buffer-line)))
+    (if (not id)
+        (message "email: no message on this line")
+        (read-string "Snooze for (30m/2h/1d/1w): "
+                     (lambda (input)
+                       (let ((secs (em--parse-duration input)))
+                         (if (not secs)
+                             (message "email: bad duration — use e.g. 2h, 1d, 1w")
+                             (begin
+                               (em--snooze-set id (+ (em--now) secs))
+                               (em--list-render 'keep)
+                               (goto-line line)
+                               (message (string-append "email: snoozed for " (em--trim input)))))))))))
+
+;; `Z` — wake a snoozed message now (useful from the Snoozed folder).
+(define (email-list-unsnooze)
+  (let ((id (em--id-at-point)))
+    (if (not id)
+        (message "email: no message on this line")
+        (begin
+          (em--snooze-clear id)
+          (if (equal? (em--st 'folder) "Snoozed")
+              (email-folder-snoozed)
+              (em--list-render 'keep))
+          (message "email: unsnoozed")))))
 
 (define (email-list-toggle-unread)
   (em--list-act
@@ -3752,6 +4234,30 @@
      (let ((e (hash-try-get (em--st 'db) id)))
        (em--queue-op id (if (member "STARRED" (hash-try-get e 'labels)) "unstar" "star"))))))
 
+;; Parse a "+Name" / "-Name" / "Name" label input and queue the add/remove op.
+(define (em--do-label id input)
+  (let* ((s (em--trim input))
+         (rm? (starts-with? s "-"))
+         (name (em--trim (if (or (starts-with? s "+") (starts-with? s "-"))
+                             (substring s 1 (string-length s))
+                             s))))
+    (if (equal? name "")
+        (message "email: no label given")
+        (begin
+          (em--queue-op id (string-append (if rm? "label-" "label+") name))
+          (message (string-append "email: " (if rm? "removed " "added ") "label " name))))))
+
+(define (email-list-label)
+  (let ((id (em--id-at-point))
+        (line (buffer-line)))
+    (if (not id)
+        (message "email: no message on this line")
+        (read-string "Label (+add, -remove): "
+                     (lambda (input)
+                       (em--do-label id input)
+                       (em--list-render 'keep)
+                       (goto-line line))))))
+
 (define (email-list-reply)
   (let ((id (em--id-at-point)))
     (if id (em--reply id #f) (message "email: no message on this line"))))
@@ -3762,6 +4268,158 @@
 
 (define (email-list-refresh) (em--list-render 'keep))
 (define (email-list-quit) (switch-to-buffer "*scratch*"))
+
+;; `T` — toggle conversation threading: collapse each Gmail thread to its
+;; newest message (with an (N) member count and unread if any member is), or
+;; back to the flat per-message list.
+(define (email-toggle-thread)
+  (em--st! 'threaded (not (em--st 'threaded)))
+  (when (equal? (current-buffer) "*email*") (em--list-render 'top))
+  (message (string-append "email: " (if (em--st 'threaded) "threaded" "flat") " view")))
+
+;; `email-contacts` (M-x, or `c` in the account menu) — the frequency-ranked
+;; address book as a read-only buffer: address, display name, correspondence
+;; count. The same list that drives To/Cc/Bcc completion.
+(define (email-contacts)
+  (em--load)
+  (em--contacts-load)
+  (let* ((cs (sort-by (lambda (c) (nth c 2)) > (em--st 'contacts)))
+         (header (string-append "Contacts — " (number->string (length cs))
+                                " correspondents — [" (em--account) "]"))
+         (lines (map (lambda (c)
+                       (string-append (em--fit (nth c 0) 40) "  "
+                                      (em--fit (nth c 1) 28) "  "
+                                      (number->string (nth c 2))))
+                     cs)))
+    (render-buffer "*email-contacts*" "email-contacts-mode"
+                   (em--join (append (list header "  q quit · j/k move · used by To/Cc/Bcc completion")
+                                     lines)
+                             "\n")
+                   (list (list 0 "keyword") (list 1 "comment")))
+    (goto-line 2)))
+
+(define (email-contacts-quit) (switch-to-buffer "*email*"))
+
+;; ── unified inbox (read-only, cross-account) ────────────────────────────────
+;; A merged inbox across every configured account, read straight from each
+;; account's on-disk `index` (no need to switch to load it). `enter` switches
+;; to the owning account and opens the message; the rest of the client keeps
+;; its one-active-account model. Refresh with `g` after a sync.
+(define (em--take xs n)
+  (if (or (null? xs) (<= n 0)) '() (cons (car xs) (em--take (cdr xs) (- n 1)))))
+
+(define (em--index-file-for name)
+  (path-join (path-join (em--data-dir) name) "index"))
+
+;; Parse an account's index file into envelope hashes tagged with its account.
+;; Standalone (doesn't touch the active store), so several can be read at once.
+(define (em--read-index-file path account)
+  (if (not (file-exists? path))
+      '()
+      (let ((lines (em--split-char (read-file path) #\newline)))
+        (if (null? lines)
+            '()
+            (filter (lambda (x) x)
+                    (map (lambda (line)
+                           (let ((f (em--split-char line (integer->char 31))))
+                             (if (= (length f) 10)
+                                 (hash 'id (nth f 0) 'thread (nth f 1)
+                                       'date (or (string->number (nth f 2)) 0)
+                                       'from (nth f 3) 'to (nth f 4) 'subject (nth f 5)
+                                       'labels (filter (lambda (t) (not (equal? t "")))
+                                                       (em--split-char (nth f 6) #\,))
+                                       'snippet (nth f 7) 'msgid (nth f 8)
+                                       'account account)
+                                 #f)))
+                         (cdr lines)))))))
+
+(define (email-unified)
+  (em--load)
+  (let* ((names (map em--acc-name (em--accounts)))
+         (all (apply append
+                     (map (lambda (n)
+                            (filter (lambda (e)
+                                      (and (member "INBOX" (hash-try-get e 'labels))
+                                           (not (member "TRASH" (hash-try-get e 'labels)))
+                                           (not (member "MUTED" (hash-try-get e 'labels)))))
+                                    (em--read-index-file (em--index-file-for n) n)))
+                          names)))
+         (sorted (em--take (sort-by (lambda (e) (hash-try-get e 'date)) > all) 300)))
+    (let* ((header (string-append "Unified inbox — " (number->string (length sorted))
+                                  " messages across " (number->string (length names)) " accounts"))
+           (built (let loop ((es sorted) (idx 3) (lines '()) (m (hash)))
+                    (if (null? es)
+                        (cons (reverse lines) m)
+                        (let* ((e (car es))
+                               (acct (hash-try-get e 'account))
+                               (line (string-append
+                                      (em--date16 (hash-try-get e 'date)) "  "
+                                      (em--fit acct 16) "  "
+                                      (em--fit (em--from-name (hash-try-get e 'from)) 20) "  "
+                                      (em--truncate (hash-try-get e 'subject) 48))))
+                          (loop (cdr es) (+ idx 1) (cons line lines)
+                                (hash-insert m idx (cons acct (hash-try-get e 'id)))))))))
+      (em--st! 'unified-map (cdr built))
+      (render-buffer "*email-unified*" "email-unified-mode"
+                     (em--join (append (list header
+                                             "  enter open · g refresh · q quit")
+                                       (car built))
+                               "\n")
+                     (list (list 0 "keyword") (list 1 "comment")))
+      (goto-line 3))))
+
+(define (email-unified-open)
+  (let ((entry (hash-try-get (em--st 'unified-map) (buffer-line))))
+    (if (not entry)
+        (message "email: no message on this line")
+        (let ((acct (car entry)) (id (cdr entry)))
+          (when (not (equal? acct (em--account)))
+            (em--do-switch acct))
+          (em--open id)))))
+
+(define (email-unified-refresh) (email-unified))
+(define (email-unified-quit) (switch-to-buffer "*email*"))
+
+;; `email-status` (bound to `t`, and in the `?` menu) — a one-line summary of
+;; the background work still in flight: indexing, sync, Maildir export, the
+;; offline cache, an in-flight request and its queue, envelope fetches, unsynced
+;; flag changes, and mail queued in the outbox. "idle" when nothing is running.
+;; Answers "what is the client doing right now, and can I switch accounts yet?".
+(define (email-status)
+  (let* ((n->s number->string)
+         (idx (if (em--st 'indexing)
+                  (list (string-append "indexing "
+                                       (n->s (- (em--st 'index-total) (length (em--st 'index-files))))
+                                       "/" (n->s (em--st 'index-total))
+                                       (if (equal? (em--st 'indexing) 'cancel) " (cancelling)" "")))
+                  '()))
+         (syn (if (em--st 'syncing)
+                  (list (string-append "syncing (" (n->s (em--st 'new-count)) " new)")) '()))
+         (exp (if (em--st 'exporting)
+                  (list (string-append "exporting " (n->s (em--st 'export-count)) " written"
+                                       (if (equal? (em--st 'exporting) 'cancel) " (cancelling)" ""))) '()))
+         (cch (if (em--st 'caching)
+                  (list (string-append "caching (" (n->s (length (em--st 'cacheq))) " left)")) '()))
+         (ath (if (em--st 'auth) (list "logging in") '()))
+         ;; A bare request in flight, not already described by one of the above.
+         (req (if (and (em--st 'busy) (not (em--st 'syncing)) (not (em--st 'exporting))
+                       (not (em--st 'caching)) (not (em--st 'auth)))
+                  (list "request in flight") '()))
+         (ops (if (> (length (em--st 'ops)) 0)
+                  (list (string-append (n->s (length (em--st 'ops))) " queued")) '()))
+         (fch (if (> (length (em--st 'fetchq)) 0)
+                  (list (string-append (n->s (length (em--st 'fetchq))) " to fetch")) '()))
+         (pnd (if (> (length (em--st 'pending-ops)) 0)
+                  (list (string-append (n->s (length (em--st 'pending-ops))) " unsynced")) '()))
+         (obx (if (> (em--outbox-count) 0)
+                  (list (string-append (n->s (em--outbox-count)) " in outbox")) '()))
+         (parts (append idx syn exp cch ath req ops fch pnd obx)))
+    (if (null? parts)
+        (message "email: idle — no background tasks running")
+        ;; One task per line (the echo area renders embedded newlines as rows).
+        (message (string-append "email — running tasks:\n"
+                                (em--join (map (lambda (p) (string-append "  " p)) parts)
+                                          "\n"))))))
 
 ;; view-buffer commands
 (define (email-view-quit)
@@ -3814,6 +4472,20 @@
       (em--queue-op id "archive")
       (message "email: archived"))))
 
+(define (email-view-label)
+  (let ((id (em--st 'current)))
+    (if (not id)
+        (message "email: no message shown")
+        (read-string "Label (+add, -remove): "
+                     (lambda (input) (em--do-label id input))))))
+
+(define (email-view-mute)
+  (let ((id (em--st 'current)))
+    (when id
+      (em--queue-op id "mute")
+      (email-view-quit)
+      (message "email: muted"))))
+
 (define (email-view-trash)
   (let ((id (em--st 'current)))
     (when id
@@ -3827,6 +4499,42 @@
     (if id
         (open-url (string-append "https://mail.google.com/mail/u/0/#all/" id))
         (message "email: no message shown"))))
+
+;; ── raw source view ─────────────────────────────────────────────────────────
+;; `email-view-raw` toggles *email-view* between the rendered reader view and
+;; the message's raw RFC 822 source (headers + MIME parts verbatim). The raw is
+;; fetched on demand (format=raw / BODY.PEEK[]); CR is dropped so CRLF lines
+;; render cleanly, but the bytes are otherwise shown as-is (latin-1, lossless).
+;; `\` toggles back; navigating to another message returns to the rendered view.
+(define em--view-raw-help
+  "  \\ back to message · n/p next/prev · q back to list")
+
+(define (em--view-render-raw id hex)
+  (em--st! 'current id)
+  (em--st! 'view-lines '())    ; no link/marker hit-testing in raw mode
+  (em--st! 'view-links '())
+  (let* ((raw (replace-regexp-in-string "\r" "" (decode-charset hex "iso-8859-1")))
+         (text (string-append "Raw source — " id "\n" em--view-raw-help "\n\n" raw)))
+    (render-buffer "*email-view*" "email-view-mode" text
+                   (list (list 0 "keyword") (list 1 "comment")))
+    (clear-overlays)
+    (goto-line 0)))
+
+(define (email-view-raw)
+  (let ((id (em--st 'current)))
+    (cond
+      ((not id) (message "email: no message shown"))
+      ;; Already raw → em--view-render redraws the reader view and clears the flag.
+      ((em--st 'view-raw) (em--view-render id))
+      (else
+       (em--with-raw
+        id
+        (lambda (hex)
+          (if (not hex)
+              (message "email: could not fetch the raw message")
+              (begin
+                (em--st! 'view-raw #t)
+                (em--view-render-raw id hex)))))))))
 
 ;; ── git patch workflow (git am) ─────────────────────────────────────────────
 ;; Emailed patches (git send-email / format-patch) ARE RFC 822 messages whose
@@ -4139,15 +4847,23 @@
       (path-join (em--acct-dir) "maildir")))))
 
 ;; ── local full-text index (this package's own "mu index") ───────────────────
-;; `M-x email-index` builds/updates a per-account SQLite FTS5 index over the
-;; account's Maildir — the same job `mu index` does, but owned by the package,
-;; queried with `email-search-local` (or `/` in the list). BM25-ranked, offline,
-;; over the whole archive. Incremental: files already in the index are skipped,
-;; so re-running only adds new mail. Requires a Maildir (run
-;; `email-export-maildir` first, or the auto-mirror `email-maildir` option).
+;; `M-x email-index` builds/updates a per-account SQLite index queried with
+;; `email-search-local` (or `/` in the list). Two tables share one db:
+;;   • `mail` — an FTS5 virtual table over sender/recipients/subject/body,
+;;     BM25-ranked, for text search and snippet() excerpts.
+;;   • `msg`  — a plain columns table (date, labels, thread, has_attach) so
+;;     the Gmail-style filters (after:/before:/is:/label:/has:) can range- and
+;;     set-query without touching FTS.
+;; The index is built from TWO sources and needs NO Maildir: every envelope in
+;; the live db (subject/from/to always searchable; body folded in when the
+;; message file is cached), PLUS — for archive coverage — any Maildir the
+;; account mirrors. Incremental: rows already present are skipped; a message
+;; first indexed bodyless is upgraded once its body lands on disk. Re-runnable
+;; and auto-run after each sync (the "email-auto-index" option).
 (define (em--index-db-file) (path-join (em--acct-dir) "search.db"))
 
-;; The Maildir to index: the configured mirror dir, else <account>/maildir.
+;; The Maildir to index for archive coverage: the mirror dir, else
+;; <account>/maildir. Only consulted by the full (`M-x email-index`) build.
 (define (em--index-source-dir)
   (or (em--maildir-auto-dir)
       (let ((d (path-join (em--acct-dir) "maildir"))) d)))
@@ -4156,27 +4872,92 @@
 (define (em--maildir-id filename)
   (em--cap "^[0-9]+\\.([^.]+)\\.macros:2," (basename filename)))
 
-;; Open the index db, creating the FTS5 schema on first use. Returns the db id
-;; (0 on failure). `id` is UNINDEXED (a stored key, not a search column).
+;; Maildir info flags → the Gmail-ish label set we filter on. `S` = seen (no
+;; UNREAD), `F` = flagged (STARRED). Everything else is archive-neutral.
+(define (em--maildir-labels-of filename)
+  (let ((flags (or (em--cap ":2,([A-Za-z]*)$" (basename filename)) "")))
+    (append (if (em--matches? "S" flags) '() (list "UNREAD"))
+            (if (em--matches? "F" flags) (list "STARRED") '()))))
+
+;; The `msg.labels` column: labels comma-wrapped (",INBOX,UNREAD,") so a
+;; `LIKE '%,UNREAD,%'` filter can't match a label as a substring of another.
+(define (em--labels-col labels)
+  (if (null? labels) "" (string-append "," (em--join labels ",") ",")))
+
+;; Schema version: bump to force a rebuild when the table shape changes. The
+;; index is fully derived (from the db + Maildir), so a rebuild loses nothing.
+(define em--index-version 2)
+
+;; Open the index db, creating (and, on an old schema, rebuilding) both tables.
+;; Returns the db id (0 on failure).
 (define (em--index-open)
   (let ((db (sqlite-open (em--index-db-file))))
     (if (= db 0)
         (begin (message (string-append "email: cannot open index — " (sqlite-last-error))) 0)
-        (if (sqlite-exec db
-                         (string-append
-                          "CREATE VIRTUAL TABLE IF NOT EXISTS mail USING fts5("
-                          "id UNINDEXED, sender, recipients, subject, "
-                          "date UNINDEXED, body, tokenize='porter unicode61');")
-                         '())
-            db
-            (begin (sqlite-close db)
-                   (message (string-append "email: index schema failed — " (sqlite-last-error)))
-                   0)))))
+        (begin
+          (let ((rows (sqlite-query db "PRAGMA user_version" '())))
+            (when (< (if (null? rows) 0 (or (string->number (car rows)) 0))
+                     em--index-version)
+              (sqlite-exec db "DROP TABLE IF EXISTS mail; DROP TABLE IF EXISTS msg;" '())))
+          (if (sqlite-exec db
+                           (string-append
+                            "CREATE VIRTUAL TABLE IF NOT EXISTS mail USING fts5("
+                            "id UNINDEXED, sender, recipients, subject, "
+                            "date UNINDEXED, body, tokenize='porter unicode61');"
+                            "CREATE TABLE IF NOT EXISTS msg("
+                            "id TEXT PRIMARY KEY, date INTEGER, labels TEXT, "
+                            "thread TEXT, has_attach INTEGER, has_body INTEGER);"
+                            "PRAGMA user_version=2;")
+                           '())
+              db
+              (begin (sqlite-close db)
+                     (message (string-append "email: index schema failed — " (sqlite-last-error)))
+                     0))))))
 
-;; The set of ids already indexed, as a hash (for incremental skip).
+;; id → 'has (indexed with a body) | 'nobody (indexed bodyless), from `msg`.
+;; Absent ids `hash-try-get` to #f — the three cases the chunk distinguishes.
 (define (em--index-existing db)
-  (let loop ((rows (sqlite-query db "SELECT id FROM mail" '())) (h (hash)))
-    (if (null? rows) h (loop (cdr rows) (hash-insert h (car rows) #t)))))
+  (let loop ((rows (sqlite-query db "SELECT id, has_body FROM msg" '())) (h (hash)))
+    (if (null? rows)
+        h
+        (let ((f (em--split-char (car rows) (integer->char 31))))
+          (loop (cdr rows)
+                (hash-insert h (nth f 0)
+                             (if (and (>= (length f) 2) (equal? (nth f 1) "1"))
+                                 'has 'nobody)))))))
+
+;; Insert / delete a message across both tables (one statement each, so the
+;; bound-param form is valid).
+(define (em--index-insert db fts-row msg-row)
+  (sqlite-exec db
+               "INSERT INTO mail(id,sender,recipients,subject,date,body) VALUES (?1,?2,?3,?4,?5,?6)"
+               fts-row)
+  (sqlite-exec db
+               "INSERT INTO msg(id,date,labels,thread,has_attach,has_body) VALUES (?1,?2,?3,?4,?5,?6)"
+               msg-row))
+(define (em--index-delete db id)
+  (sqlite-exec db "DELETE FROM mail WHERE id=?1" (list id))
+  (sqlite-exec db "DELETE FROM msg WHERE id=?1" (list id)))
+
+;; Index fields for a live-db message: envelope headers always, body + attach
+;; flag from the cached message file when present (cheap — it's already decoded
+;; text, so no MIME re-parse). Returns (fts-row msg-row).
+(define (em--index-fields-db id)
+  (let* ((e (hash-try-get (em--st 'db) id))
+         (msg (em--read-message id))
+         (body (if msg (em--join (nth msg 1) "\n") ""))
+         (atts (if msg (nth msg 2) '()))
+         (from (if e (hash-try-get e 'from) ""))
+         (to (if e (hash-try-get e 'to) ""))
+         (subject (if e (hash-try-get e 'subject) ""))
+         (date (number->string (if e (hash-try-get e 'date) 0)))
+         (labels (if e (hash-try-get e 'labels) '()))
+         (thread (if e (or (hash-try-get e 'thread) "") ""))
+         (has-body (if (equal? (em--trim body) "") 0 1)))
+    (list
+     (list id from to subject date (string-append subject "\n" body))
+     (list id date (em--labels-col labels) thread
+           (number->string (if (pair? atts) 1 0)) (number->string has-body)))))
 
 ;; Body text for the SEARCH INDEX — deliberately NOT `em--pick-body-mime`. The
 ;; viewer's picker eagerly runs the vendored reader-mode layout engine
@@ -4202,21 +4983,29 @@
                (em--html->text-basic (em--leaf-text (car ps))))
               (else (loop (cdr ps)))))))
 
-;; Parse one raw RFC 822 message into the row we index: decoded from/to/
-;; subject headers + the plain-text body. `date` is the filename epoch.
-(define (em--index-row id date raw)
+;; Index fields for an archive Maildir file: parse the raw RFC 822, derive
+;; labels from the info flags, sniff a Content-Disposition for has_attach.
+;; `date` is the filename epoch string. Returns (fts-row msg-row).
+(define (em--index-fields-md id date raw filename)
   (let* ((sp (em--split-raw raw))
          (hs (em--parse-headers (car sp)))
          (leaves (em--mime-leaves raw ""))
-         (body (em--index-body leaves)))
-    (list id
-          (em--sanitize (em--decode-header (em--hdr hs "from")))
-          (em--sanitize (em--decode-header (em--hdr hs "to")))
-          (em--sanitize (em--decode-header (em--hdr hs "subject")))
-          date
-          ;; Include the subject in the body column too, so a bare MATCH
-          ;; without a column filter still finds subject hits.
-          (string-append (em--decode-header (em--hdr hs "subject")) "\n" body))))
+         (body (em--index-body leaves))
+         (subject (em--decode-header (em--hdr hs "subject")))
+         (labels (em--maildir-labels-of filename))
+         (has-attach (if (em--matches? "(?i)content-disposition:\\s*attachment" raw) 1 0)))
+    (list
+     (list id
+           (em--sanitize (em--decode-header (em--hdr hs "from")))
+           (em--sanitize (em--decode-header (em--hdr hs "to")))
+           (em--sanitize subject)
+           date
+           ;; Include the subject in the body column too, so a bare MATCH
+           ;; without a column filter still finds subject hits.
+           (string-append subject "\n" body))
+     (list id date (em--labels-col labels) ""
+           (number->string has-attach)
+           (if (equal? (em--trim body) "") "0" "1")))))
 
 ;; Indexing runs in timer-scheduled CHUNKS rather than one blocking loop. Each
 ;; chunk parses up to `em--index-chunk-size` new messages, then yields via
@@ -4228,7 +5017,8 @@
 (define em--index-chunk-size 5)
 
 ;; Close out a build: free the db handle + build state and report. Chunks commit
-;; their own transactions, so there is nothing to commit here.
+;; their own transactions, so there is nothing to commit here. A quiet build
+;; (auto-index after sync) reports nothing.
 (define (em--index-finish note)
   (let ((db (em--st 'index-db)))
     (when (and db (> db 0)) (sqlite-close db)))
@@ -4237,42 +5027,74 @@
     (em--st! 'index-db #f)
     (em--st! 'index-files '())
     (em--st! 'index-existing (hash))
-    (message (string-append "email: indexing " note " — " (number->string new)
-                            " new, " (number->string total) " total → "
-                            (em--index-db-file)))))
+    (when (not (em--st 'index-quiet))
+      (message (string-append "email: indexing " note " — " (number->string new)
+                              " new, " (number->string total) " total → "
+                              (em--index-db-file))))
+    (em--st! 'index-quiet #f)))
+
+;; The work list: a db item ('db . id) for every known envelope, plus — when
+;; `include-md?` — a Maildir item ('md . path) for every archived file NOT in
+;; the db. Deduped so a message present in both is indexed once, from the db.
+(define (em--index-build-worklist include-md?)
+  (let* ((db-ids (em--st 'ids))
+         (in-db (let loop ((xs db-ids) (h (hash)))
+                  (if (null? xs) h (loop (cdr xs) (hash-insert h (car xs) #t)))))
+         (db-items (map (lambda (id) (cons 'db id)) db-ids))
+         (md-items (if (not include-md?)
+                       '()
+                       (let ((cur (path-join (em--index-source-dir) "cur")))
+                         (if (not (file-directory? cur))
+                             '()
+                             (filter (lambda (it) it)
+                                     (map (lambda (f)
+                                            (let ((id (em--maildir-id f)))
+                                              (if (and id (not (hash-try-get in-db id)))
+                                                  (cons 'md f)
+                                                  #f)))
+                                          (list-directory cur))))))))
+    (append db-items md-items)))
+
+;; Start a chunked build. `include-md?` folds in the archive Maildir; `quiet?`
+;; suppresses progress/summary (the after-sync auto pass). Returns #t if armed.
+(define (em--index-start include-md? quiet?)
+  (let ((db (em--index-open)))
+    (if (not (> db 0))
+        (begin (when (not quiet?) (message "email: cannot open index")) #f)
+        (let ((existing (em--index-existing db))
+              (items (em--index-build-worklist include-md?)))
+          (em--st! 'index-db db)
+          (em--st! 'index-files items)
+          (em--st! 'index-existing existing)
+          (em--st! 'index-new 0)
+          (em--st! 'index-total (length items))
+          (em--st! 'index-quiet quiet?)
+          (em--st! 'indexing 'run)
+          (when (not quiet?)
+            (message (string-append "email: indexing started — "
+                                    (number->string (length items)) " messages")))
+          (run-with-timer 0 "em--index-chunk")
+          #t))))
 
 (define (email-index)
   (em--load)
-  (cond
-    ((em--st 'indexing)
-     (message "email: indexing already in progress — C-g cancels it"))
-    (else
-     (let ((dir (em--index-source-dir)))
-       (cond
-         ((not (file-directory? (path-join dir "cur")))
-          (message (string-append "email: no Maildir at " dir
-                                  " — run M-x email-export-maildir first")))
-         (else
-          (let ((db (em--index-open)))
-            (if (not (> db 0))
-                (message "email: cannot open index")
-                (let* ((existing (em--index-existing db))
-                       (files (filter (lambda (f) (em--maildir-id f))
-                                      (list-directory (path-join dir "cur")))))
-                  (em--st! 'index-db db)
-                  (em--st! 'index-files files)
-                  (em--st! 'index-existing existing)
-                  (em--st! 'index-new 0)
-                  (em--st! 'index-total (length files))
-                  (em--st! 'indexing 'run)
-                  (message (string-append "email: indexing started — "
-                                          (number->string (length files))
-                                          " messages in " dir))
-                  (run-with-timer 0 "em--index-chunk"))))))))))
+  (if (em--st 'indexing)
+      (message "email: indexing already in progress — C-g cancels it")
+      (em--index-start #t #f)))
+
+;; After each sync: quietly index new mail from the live db (no Maildir
+;; required), so `/` local search covers what just synced. Off with
+;; (set-option "email-auto-index" "false"); skipped while a build runs.
+(define (em--auto-index)
+  (when (and (not (em--st 'indexing))
+             (not (equal? (em--knob "email-auto-index" "true") "false")))
+    (em--index-start #f #t)))
 
 ;; One chunk of the running build — fired by `run-with-timer`, reschedules
-;; itself until the file list drains or a cancel is seen. Registered as a
-;; command so the timer can dispatch it by name.
+;; itself until the work list drains or a cancel is seen. Registered as a
+;; command so the timer can dispatch it by name. Skips (already-indexed, and
+;; bodyless db rows with no body yet on disk) are cheap and do NOT fill the
+;; chunk; only inserts/upgrades do, so a busy chunk always yields promptly.
 (define (em--index-chunk)
   (cond
     ((equal? (em--st 'indexing) 'cancel) (em--index-finish "cancelled"))
@@ -4293,21 +5115,42 @@
             (sqlite-exec db "COMMIT" '())
             (em--st! 'index-files fs)
             (em--st! 'index-new new)
-            (message (string-append "email: indexing … "
-                                    (number->string (- total (length fs)))
-                                    "/" (number->string total)))
+            (when (not (em--st 'index-quiet))
+              (message (string-append "email: indexing … "
+                                      (number->string (- total (length fs)))
+                                      "/" (number->string total))))
             (run-with-timer 0 "em--index-chunk"))
            (else
-            (let* ((path (car fs)) (id (em--maildir-id path)))
-              (if (or (not id) (hash-try-get existing id))
-                  (loop (cdr fs) new k)                       ; skip: cheap, doesn't fill the chunk
-                  (let* ((date (or (em--cap "^([0-9]+)\\." (basename path)) "0"))
-                         (raw (read-file path))
-                         (row (em--index-row id date raw)))
-                    (sqlite-exec db
-                                 "INSERT INTO mail(id,sender,recipients,subject,date,body) VALUES (?1,?2,?3,?4,?5,?6)"
-                                 row)
-                    (loop (cdr fs) (+ new 1) (+ k 1)))))))))))) ; only new inserts fill the chunk
+            (let* ((item (car fs))
+                   (tag (car item)))
+              (if (equal? tag 'md)
+                  ;; archive Maildir file — indexed once, never upgraded
+                  (let* ((path (cdr item))
+                         (id (em--maildir-id path)))
+                    (if (or (not id) (hash-try-get existing id))
+                        (loop (cdr fs) new k)
+                        (let* ((date (or (em--cap "^([0-9]+)\\." (basename path)) "0"))
+                               (raw (read-file path))
+                               (fields (em--index-fields-md id date raw path)))
+                          (em--index-insert db (nth fields 0) (nth fields 1))
+                          (loop (cdr fs) (+ new 1) (+ k 1)))))
+                  ;; live-db message — insert new, or upgrade a bodyless row
+                  ;; once its body is cached on disk
+                  (let* ((id (cdr item))
+                         (state (hash-try-get existing id)))
+                    (cond
+                      ((equal? state 'has) (loop (cdr fs) new k))
+                      ((equal? state 'nobody)
+                       (if (not (file-exists? (em--msg-file id)))
+                           (loop (cdr fs) new k)
+                           (let ((fields (em--index-fields-db id)))
+                             (em--index-delete db id)
+                             (em--index-insert db (nth fields 0) (nth fields 1))
+                             (loop (cdr fs) (+ new 1) (+ k 1)))))
+                      (else
+                       (let ((fields (em--index-fields-db id)))
+                         (em--index-insert db (nth fields 0) (nth fields 1))
+                         (loop (cdr fs) (+ new 1) (+ k 1)))))))))))))))
 
 ;; M-x email-index-cancel (and C-g) — stop a running build at the next chunk.
 (define (email-index-cancel)
@@ -4324,26 +5167,75 @@
     ((equal? (em--st 'exporting) 'run) (email-export-cancel))
     (else (keyboard-quit))))
 
-;; `email-search-local` — a BM25-ranked FTS5 query over the local index. The
-;; query is Gmail-ish sugar mapped to FTS5: `from:x` / `subject:y` become
-;; column filters, bare words match anywhere. Results pin as a folder view
-;; (envelopes for ids not in the db are pulled so they can render).
-(define (em--fts-query input)
-  ;; Translate "from:foo subject:bar baz" → an FTS5 MATCH string. Column
-  ;; filters use FTS5's `col:term` syntax; bare terms are ANDed.
-  (em--join
-   (map (lambda (tok)
+;; `email-search-local` — a query over the local index. The query is Gmail-ish
+;; sugar split into two halves: TEXT terms (bare words, and `from:`/`to:`/
+;; `subject:` column filters) run through FTS5 MATCH with BM25 ranking and a
+;; snippet() excerpt; FILTER terms (`after:`/`before:` dates, `is:unread|read|
+;; starred`, `label:x`, `has:attachment`) become SQL predicates on the `msg`
+;; columns table. A query may mix both, or use only filters. Results pin as a
+;; folder view (envelopes for ids not in the db are pulled so they can render).
+
+;; "2024-01-01" or "20240101" → UTC-midnight epoch, or #f.
+(define (em--epoch-of-datestr s)
+  (let ((c (regexp-captures "^([0-9]{4})-?([0-9]{2})-?([0-9]{2})$" s)))
+    (if (null? c)
+        #f
+        (em--epoch (or (string->number (nth c 1)) 1970)
+                   (or (string->number (nth c 2)) 1)
+                   (or (string->number (nth c 3)) 1) 0 0 0))))
+
+;; Values are bound params in the FTS half but INLINED (LIKE patterns / ints)
+;; in the filter half, so strip anything that could break a SQL string literal.
+(define (em--sql-like-escape s)
+  (list->string
+   (filter (lambda (c) (not (or (char=? c #\') (char=? c #\%)
+                                (char=? c #\,) (char=? c #\\))))
+           (string->list s))))
+
+;; Split the query → (match-string . filter-sql). `match-string` is the FTS5
+;; MATCH text ("" when the query is filters-only); `filter-sql` is a string of
+;; " AND …" clauses over `msg` ("" when there are no filters).
+(define (em--parse-local-query input)
+  (let loop ((toks (filter (lambda (t) (not (equal? t "")))
+                           (em--split-char (em--trim input) #\space)))
+             (mterms '()) (filt '()))
+    (if (null? toks)
+        (cons (em--join (reverse mterms) " ") (em--concat (reverse filt)))
+        (let ((tok (car toks)))
           (cond
             ((em--matches? "^from:" tok)
-             (string-append "sender:" (substring tok 5 (string-length tok))))
+             (loop (cdr toks)
+                   (cons (string-append "sender:" (substring tok 5 (string-length tok))) mterms)
+                   filt))
             ((em--matches? "^to:" tok)
-             (string-append "recipients:" (substring tok 3 (string-length tok))))
+             (loop (cdr toks)
+                   (cons (string-append "recipients:" (substring tok 3 (string-length tok))) mterms)
+                   filt))
             ((em--matches? "^subject:" tok)
-             (string-append "subject:" (substring tok 8 (string-length tok))))
-            (else tok)))
-        (filter (lambda (t) (not (equal? t "")))
-                (em--split-char (em--trim input) #\space)))
-   " "))
+             (loop (cdr toks)
+                   (cons (string-append "subject:" (substring tok 8 (string-length tok))) mterms)
+                   filt))
+            ((em--matches? "^after:" tok)
+             (let ((ep (em--epoch-of-datestr (substring tok 6 (string-length tok)))))
+               (loop (cdr toks) mterms
+                     (if ep (cons (string-append " AND msg.date>=" (number->string ep)) filt) filt))))
+            ((em--matches? "^before:" tok)
+             (let ((ep (em--epoch-of-datestr (substring tok 7 (string-length tok)))))
+               (loop (cdr toks) mterms
+                     (if ep (cons (string-append " AND msg.date<" (number->string ep)) filt) filt))))
+            ((equal? tok "is:unread")
+             (loop (cdr toks) mterms (cons " AND msg.labels LIKE '%,UNREAD,%'" filt)))
+            ((equal? tok "is:read")
+             (loop (cdr toks) mterms (cons " AND msg.labels NOT LIKE '%,UNREAD,%'" filt)))
+            ((equal? tok "is:starred")
+             (loop (cdr toks) mterms (cons " AND msg.labels LIKE '%,STARRED,%'" filt)))
+            ((or (equal? tok "has:attachment") (equal? tok "has:attach"))
+             (loop (cdr toks) mterms (cons " AND msg.has_attach=1" filt)))
+            ((em--matches? "^label:" tok)
+             (let ((lbl (em--sql-like-escape (substring tok 6 (string-length tok)))))
+               (loop (cdr toks) mterms
+                     (cons (string-append " AND msg.labels LIKE '%," lbl ",%'") filt))))
+            (else (loop (cdr toks) (cons tok mterms) filt)))))))
 
 (define (email-search-local)
   (if (not (file-exists? (em--index-db-file)))
@@ -4354,21 +5246,57 @@
          (let ((q (em--trim input)))
            (if (equal? q "")
                (em--goto-inbox)
-               (let ((db (sqlite-open (em--index-db-file))))
-                 (if (= db 0)
-                     (message "email: cannot open index")
-                     (let ((ids (map (lambda (r) r)   ; single-column rows = bare ids
-                                     (sqlite-query db
-                                                   "SELECT id FROM mail WHERE mail MATCH ?1 ORDER BY rank LIMIT 200"
-                                                   (list (em--fts-query q))))))
-                       (sqlite-close db)
-                       (cond
-                         ((null? ids) (message (string-append "email: no local matches for " q)))
-                         (else
-                          ;; Some hits may predate the current db (indexed from
-                          ;; the archive); fetch envelopes for the unknown ones
-                          ;; so the list can render them.
-                          (em--local-search-show ids (string-append "local: " q)))))))))))))
+               (em--run-local-search q)))))))
+
+(define (em--run-local-search q)
+  (let ((db (sqlite-open (em--index-db-file))))
+    (if (= db 0)
+        (message "email: cannot open index")
+        (let* ((pq (em--parse-local-query q))
+               (mtext (car pq))
+               (filt (cdr pq)))
+          (cond
+            ;; text (+ optional filters): FTS join, ranked, with snippets
+            ((not (equal? mtext ""))
+             (let ((rows (sqlite-query
+                          db
+                          (string-append
+                           "SELECT mail.id, snippet(mail, 5, '', '', ' … ', 8) "
+                           "FROM mail JOIN msg ON msg.id = mail.id "
+                           "WHERE mail MATCH ?1" filt
+                           " ORDER BY rank LIMIT 200")
+                          (list mtext))))
+               (sqlite-close db)
+               (em--finish-local-search q rows #t)))
+            ;; filters only: straight msg scan, newest first, no snippet
+            ((not (equal? filt ""))
+             (let ((rows (sqlite-query
+                          db
+                          (string-append "SELECT id FROM msg WHERE 1=1" filt
+                                         " ORDER BY date DESC LIMIT 200")
+                          '())))
+               (sqlite-close db)
+               (em--finish-local-search q rows #f)))
+            (else (sqlite-close db) (em--goto-inbox)))))))
+
+;; Turn query rows into an id list (+ snippet map when present), stash the
+;; snippets for the renderer, and pin the result view.
+(define (em--finish-local-search q rows snip?)
+  (let loop ((rs rows) (ids '()) (snips (hash)))
+    (if (null? rs)
+        (let ((ids (reverse ids)))
+          (if (null? ids)
+              (begin (em--st! 'search-snippets #f)
+                     (message (string-append "email: no local matches for " q)))
+              (begin
+                (em--st! 'search-snippets (if snip? snips #f))
+                (em--local-search-show ids (string-append "local: " q)))))
+        (if snip?
+            (let ((f (em--split-char (car rs) (integer->char 31))))
+              (loop (cdr rs) (cons (nth f 0) ids)
+                    (hash-insert snips (nth f 0)
+                                 (if (>= (length f) 2) (em--trim (nth f 1)) ""))))
+            (loop (cdr rs) (cons (car rs) ids) snips)))))
 
 ;; Show local-search result ids: render immediately for those already in the
 ;; db, and (best-effort) pull envelopes for the rest, then pin the view.
@@ -4601,7 +5529,7 @@
 (define (em--queue-to-outbox)
   (let ((path (em--outbox-save)))
     (if (and path (file-exists? path))
-        (begin (kill-buffer-named "*email-compose*") #t)
+        (begin (kill-buffer-named "*email-compose*") (em--draft-clear) #t)
         (begin (message "email: could not write to the outbox") #f))))
 
 ;; Best-effort human reason from a Gmail JSON error body, e.g.
@@ -4794,15 +5722,22 @@
 (define-key "email-list-mode" "shift-d" 'email-list-trash)
 (define-key "email-list-mode" "shift-u" 'email-list-toggle-unread)
 (define-key "email-list-mode" "*"       'email-list-toggle-star)
+(define-key "email-list-mode" "l"       'email-list-label)
+(define-key "email-list-mode" "m"       'email-list-mute)
+(define-key "email-list-mode" "z"       'email-list-snooze)
+(define-key "email-list-mode" "shift-z" 'email-list-unsnooze)
 (define-key "email-list-mode" "s"       'email-list-search)
 (define-key "email-list-mode" "/"       'email-search-local)
 (define-key "email-list-mode" "f"       'email-folders)
+(define-key "email-list-mode" "b"       'email-bookmarks)
 (define-key "email-list-mode" "i"       'email-folder-inbox)
+(define-key "email-list-mode" "shift-t" 'email-toggle-thread)
 (define-key "email-list-mode" "a"       'email-cycle-account)
 (define-key "email-list-mode" "g"       'email-list-refresh)
 (define-key "email-list-mode" "shift-g" 'email-sync)
 (define-key "email-list-mode" "shift-l" 'email-login)
 (define-key "email-list-mode" "shift-o" 'email-outbox)
+(define-key "email-list-mode" "t"       'email-status)
 (define-key "email-list-mode" "q"       'email-list-quit)
 (define-key "email-list-mode" "ctrl-g"  'email-keyboard-quit)
 
@@ -4817,13 +5752,26 @@
 (define-key "email-view-mode" "?"       'email-view-menu)
 (define-key "email-view-mode" "shift-a" 'email-view-archive)
 (define-key "email-view-mode" "shift-d" 'email-view-trash)
+(define-key "email-view-mode" "l"       'email-view-label)
+(define-key "email-view-mode" "m"       'email-view-mute)
 (define-key "email-view-mode" "shift-w" 'email-view-save-attachment)
 (define-key "email-view-mode" "b"       'email-view-browse)
+(define-key "email-view-mode" "\\"      'email-view-raw)
+(define-key "email-view-mode" "t"       'email-status)
 
 (define-key "email-compose-mode" "ctrl-c ctrl-c" 'email-compose-send)
 (define-key "email-compose-mode" "ctrl-c ctrl-k" 'email-compose-cancel)
 (define-key "email-compose-mode" "ctrl-c ctrl-l" 'email-compose-send-later)
 (define-key "email-compose-mode" "ctrl-c ctrl-t" 'email-compose-menu)
+
+(define-key "email-contacts-mode" "q"     'email-contacts-quit)
+(define-key "email-contacts-mode" "ctrl-g" 'keyboard-quit)
+
+(define-key "email-unified-mode" "enter"   'email-unified-open)
+(define-key "email-unified-mode" "mouse-1" 'email-unified-open)
+(define-key "email-unified-mode" "g"       'email-unified-refresh)
+(define-key "email-unified-mode" "q"       'email-unified-quit)
+(define-key "email-unified-mode" "ctrl-g"  'keyboard-quit)
 
 (define-key "email-outbox-mode" "enter"   'email-outbox-edit)
 (define-key "email-outbox-mode" "mouse-1" 'email-outbox-edit)
@@ -4851,7 +5799,8 @@
    (define-key mode "space"  'evil-scroll-down)
    (define-key mode "home"   'beginning-of-buffer)
    (define-key mode "end"    'end-of-buffer))
- (list "email-list-mode" "email-view-mode" "email-outbox-mode"))
+ (list "email-list-mode" "email-view-mode" "email-outbox-mode"
+       "email-contacts-mode" "email-unified-mode"))
 
 ;; Modal (evil + helix) overlays: vim motion plus the mode's own keys.
 (for-each
@@ -4872,6 +5821,16 @@
      (define-key km "g g"     'evil-goto-first-line)
      (define-key km "shift-g" 'evil-goto-last-line))
    (let ((km (string-append prefix "email-outbox-mode")))
+     (define-key km "j"       'next-line)
+     (define-key km "k"       'previous-line)
+     (define-key km "g g"     'evil-goto-first-line)
+     (define-key km "shift-g" 'evil-goto-last-line))
+   (let ((km (string-append prefix "email-contacts-mode")))
+     (define-key km "j"       'next-line)
+     (define-key km "k"       'previous-line)
+     (define-key km "g g"     'evil-goto-first-line)
+     (define-key km "shift-g" 'evil-goto-last-line))
+   (let ((km (string-append prefix "email-unified-mode")))
      (define-key km "j"       'next-line)
      (define-key km "k"       'previous-line)
      (define-key km "g g"     'evil-goto-first-line)
@@ -4912,6 +5871,13 @@
 (register-command "email-list-trash")
 (register-command "email-list-toggle-unread")
 (register-command "email-list-toggle-star")
+(register-command "email-list-label")
+(register-command "email-view-label")
+(register-command "email-list-mute")
+(register-command "email-view-mute")
+(register-command "email-list-snooze")
+(register-command "email-list-unsnooze")
+(register-command "email-folder-snoozed")
 (register-command "email-list-search")
 (register-command "email-folders")
 (register-command "email-folder-inbox")
@@ -4920,6 +5886,7 @@
 (register-command "email-folder-sent")
 (register-command "email-folder-all")
 (register-command "email-folder-trash")
+(register-command "email-bookmarks")
 (register-command "email-switch-account")
 (register-command "email-add-account")
 (register-command "email-reload-authinfo")
@@ -4933,6 +5900,13 @@
 (register-command "email-outbox-refresh")
 (register-command "email-outbox-quit")
 (register-command "email-toggle-mode")
+(register-command "email-toggle-thread")
+(register-command "email-contacts")
+(register-command "email-contacts-quit")
+(register-command "email-unified")
+(register-command "email-unified-open")
+(register-command "email-unified-refresh")
+(register-command "email-unified-quit")
 (register-command "email-view-quit")
 (register-command "email-view-next")
 (register-command "email-view-prev")
@@ -4942,3 +5916,5 @@
 (register-command "email-view-trash")
 (register-command "email-view-save-attachment")
 (register-command "email-view-browse")
+(register-command "email-view-raw")
+(register-command "email-status")

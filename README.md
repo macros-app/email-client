@@ -44,8 +44,10 @@ field except `'name` is optional and falls back to the matching global
 Recognized per-account fields (all optional except `'name`): `method`,
 `client-id`, `client-secret`, `query`, `address` (From: address),
 `from-name` (From: display name), `imap-host`, `smtp-host`, `mode`,
-`maildir`, `fetch-count`, `auto-sync-minutes`. Put shared values in the
-global `email-…` options and only the per-mailbox differences in each hash.
+`maildir`, `fetch-count`, `auto-sync-minutes`, `signature` (appended to
+composes), `threaded` (`"true"` defaults the list to conversation view). Put
+shared values in the global `email-…` options and only the per-mailbox
+differences in each hash.
 
 The first entry is the default active account; `a` cycles and
 `M-x email-switch-account` prompts by name. A simple setup can still use the
@@ -192,6 +194,11 @@ expanded). Each account gets its own subdirectory:
 │   ├── index                  ← envelope db: one line per message (US-separated
 │   │                            fields), sync baselines on the header line
 │   ├── pending                ← queued flag ops awaiting the next sync
+│   ├── contacts               ← frequency-ranked address book (completion source)
+│   ├── snooze                 ← id␟until-epoch per snoozed message
+│   ├── search.db              ← SQLite FTS5 + columns index for local search
+│   ├── drafts/draft.eml       ← autosaved in-progress compose (recovered by C)
+│   ├── outbox/*.eml           ← queued sends (offline / send-later)
 │   └── messages/
 │       └── <id>               ← one normalized UTF-8 text file per opened
 │                                message: decoded headers, body text, and an
@@ -220,12 +227,14 @@ On systems without the `security` CLI they fall back to chmod-600 files
 | `R` / `E` | reply / reply all | `R` / `E` | reply / reply all | `C-c C-b` | add Bcc |
 | `A` / `D` | archive / trash | `A` / `D` | archive / trash | `C-c C-l` | send later (outbox) |
 | `U` / `*` | unread / star | `W` | save attachment | `C-c C-t` | menu |
-| | | | | `M-i` | complete address |
-| `s` / `/` | server / local search | `b` / `q` | Gmail web / back | | |
-| `f` / `i` | folders / inbox | | | | |
-| `a` / `O` | account / outbox | | | | |
+| `l` / `m` | label / mute | `l` / `m` | label / mute | `M-i` | complete address |
+| `z` / `Z` | snooze / unsnooze | `b` / `q` | Gmail web / back | | |
+| `T` | toggle threading | | | | |
+| `s` / `/` | server / local search | | | | |
+| `f` / `b` | folders / saved searches | | | | |
+| `i` / `a` | inbox / account | | | | |
 | `g` / `G` | redraw / sync | | | | |
-| `L` / `q` | login / quit | | | | |
+| `O` / `L` / `q` | outbox / login / quit | | | | |
 
 `?` opens a magit-style transient listing **every command** (message actions,
 flags, folders and search, account switching, Maildir export, index rebuild) —
@@ -346,23 +355,98 @@ info flags (`S` read, `F` starred, `D` draft, `T` trashed).
 
 ## Local full-text search (the package's own index)
 
-Instead of `mu index`, the package builds and owns its own search index:
+Instead of `mu index`, the package builds and owns its own search index — a
+`<account-dir>/search.db` holding **two tables**: a **SQLite FTS5** virtual
+table over sender/recipients/subject/body (BM25-ranked text search with
+`snippet()` excerpts), and a plain columns table (date, labels, thread,
+has-attachment) so the Gmail-style filters can range- and set-query without
+touching FTS.
 
-- **`M-x email-index`** (or `f` → `x`) builds a **SQLite FTS5** index over the
-  account's Maildir at `<account-dir>/search.db` — BM25-ranked, offline, over
-  the whole archive. It's **incremental**: re-running only adds new files, so
-  pair it with the auto-mirror (`email-maildir`) and re-run whenever you like
-  (manually, or from a macros `run-with-timer`).
+- **No Maildir required.** The index is built from the **live envelope db**
+  (every synced message — subject/from/to always searchable, the body folded in
+  once its cached message file exists) plus, for deep-archive coverage, any
+  Maildir the account mirrors. A message first indexed bodyless is **upgraded**
+  to full-text once you open it (its body lands on disk) and re-index.
+- **Auto-indexed after every sync.** Each `G` quietly folds new mail into the
+  index, so `/` local search covers what you just synced with nothing to
+  remember. Turn it off with `(set-option "email-auto-index" "false")`.
+- **`M-x email-index`** (or `f` → `x`) forces a full rebuild, including the
+  archive Maildir. Incremental — re-running only adds new mail.
 - **`M-x email-search-local`** (or `/`, or `f` → `/`) queries it. Bare words
-  match anywhere; `from:`, `to:`, `subject:` are column filters; FTS5 phrase
-  (`"..."`), prefix (`pay*`), boolean (`AND`/`OR`/`NOT`), and `NEAR()` syntax
-  all work — e.g. `from:kim invoice NEAR(payment overdue)`. Results pin as a
-  folder view; hits older than your synced window are pulled from the Maildir
-  so they still render.
+  match anywhere; `from:`/`to:`/`subject:` are FTS column filters; and the
+  metadata filters map to the columns table:
+  - `after:2024-01-01` / `before:2024-06-30` (dates; `YYYYMMDD` also works)
+  - `is:unread` / `is:read` / `is:starred`
+  - `has:attachment`
+  - `label:invoices`
 
-Requires a Maildir first (`M-x email-export-maildir`, or the auto-mirror
-option). This uses the generic `sqlite-*` primitives added to macros, so the
-index is a normal SQLite database — inspectable with any SQLite tool.
+  e.g. `from:kim invoice after:2024-01-01 has:attachment`. FTS5 phrase
+  (`"..."`), prefix (`pay*`), boolean (`AND`/`OR`/`NOT`), and `NEAR()` syntax
+  still work in the text half. Each hit shows a matched **snippet** under it.
+  A filters-only query (no words) scans the columns table newest-first.
+
+This uses the generic `sqlite-*` primitives added to macros, so the index is a
+normal SQLite database — inspectable with any SQLite tool. (The schema is
+versioned; a shape change triggers an automatic one-time rebuild.)
+
+## Conversation threading
+
+`T` in the list (or the `?` menu) collapses the view **by conversation**: each
+Gmail thread shows only its newest message, with an `(N)` member count and the
+unread face if any message in the thread is unread — so a 20-message thread is
+one row. `T` toggles back to the flat per-message list. Default the view for an
+account with `'threaded "true"` in its config hash (or the global
+`email-threaded` option).
+
+## Labels, mute, and snooze
+
+- **`l`** (list or view) prompts `+Name` to add a Gmail label or `-Name` to
+  remove one — applied locally at once and queued as a backend-neutral op that
+  the next sync replays (REST `modify`, resolving the label name to its id; IMAP
+  `X-GM-LABELS`). Reconciles to the server's label set on the next sync.
+- **`m`** mutes the conversation: it leaves the inbox and stays out even when it
+  gets a reply. Over IMAP this sets Gmail's real `\Muted`; the local `MUTED`
+  tag keeps it hidden regardless of backend.
+- **`z`** snoozes the message out of the inbox for a duration (`30m`, `2h`,
+  `1d`, `1w`) — purely local, no server state. It reappears automatically when
+  the time passes; **`Z`** wakes it early. The **Snoozed** folder (folder popup
+  `n`) lists everything currently snoozed.
+
+## Contacts (frequency-ranked address book)
+
+To/Cc/Bcc completion is backed by a persisted `<account-dir>/contacts` file,
+ranked by how often you correspond with each address — senders count as you
+sync, recipients count more as you send. `M-x email-contacts` (account menu
+`c`) shows the ranked list.
+
+## Saved searches (bookmarks)
+
+The **`email-bookmarks`** option is a list of named Gmail queries; `b` (or the
+folder popup / `?` menu) prompts by name and pins the query as a folder view:
+
+```scheme
+(set-option "email-bookmarks"
+  (list (hash 'name "Unpaid"    'query "label:invoices -label:paid")
+        (hash 'name "From team" 'query "from:team@corp.com newer_than:7d")))
+```
+
+## Drafts and signatures
+
+- **Draft autosave.** While composing, the buffer is periodically written to
+  `<account-dir>/drafts/draft.eml`, so a crash or accidental quit never loses an
+  in-progress message. The next blank `C` **recovers** it; sending, queuing, or
+  discarding clears it.
+- **Signatures.** Set `'signature` per account (or the global `email-signature`
+  option) and it's appended under the conventional `-- ` delimiter to new
+  messages and replies. A literal `\n` in the value becomes a newline.
+
+## Unified inbox (all accounts at once)
+
+`M-x email-unified` (account menu `u`) reads every configured account's index
+straight off disk and shows one merged, date-sorted inbox with an account
+column. `enter` switches to the owning account and opens the message; `g`
+refreshes after a sync. The rest of the client keeps its one-active-account
+model.
 
 ## Applying emailed patches (git am)
 
