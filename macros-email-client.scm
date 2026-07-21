@@ -136,6 +136,12 @@
    'caching      #f      ; an eager-cache pass is in flight
    'outbox-files '()     ; filenames rendered in *email-outbox*
    'exporting    #f      ; Maildir export: #f | 'run | 'cancel
+   'indexing     #f      ; local FTS index build: #f | 'run | 'cancel
+   'index-db     #f      ; open sqlite handle for the running build
+   'index-files  '()     ; maildir files still to index this build
+   'index-existing (hash); ids already in the db (incremental skip set)
+   'index-new    0       ; rows inserted this build
+   'index-total  0       ; total maildir files this build
    'export-dir   ""      ; destination Maildir root
    'export-queue '()     ; ids of the current REST page awaiting fetch
    'export-token ""      ; next messages.list pageToken
@@ -327,14 +333,17 @@
 (define (em--trim s) (replace-regexp-in-string "^\\s+|\\s+$" "" s))
 (define (em--trim-crlf s) (replace-regexp-in-string "[\r\n]+$" "" s))
 
-;; Split `s` on every occurrence of the single character `ch` — one char-list
-;; pass, so no byte/char index mixing (the web-reader war story).
+;; Split `s` on every occurrence of the single character `ch`. Delegates to the
+;; native `split-many` (a literal, byte-safe Rust split) instead of a Steel
+;; char-list walk: the old walk was O(n) with a large per-char constant, which
+;; made MIME parsing of a large message (`em--mime-leaves` splits the whole
+;; body, once per nesting level) take SECONDS — a 912 KB message went 277 ms →
+;; 3 ms here, and a whole-archive index that had frozen the UI (C-g/`q`
+;; unresponsive) is now responsive. `split-many` matches this function's
+;; semantics exactly on empty/leading/trailing/consecutive delimiters, and its
+;; delimiter is literal (no regex), so control-char field separators split fine.
 (define (em--split-char s ch)
-  (let loop ((cs (string->list s)) (cur '()) (acc '()))
-    (cond ((null? cs) (reverse (cons (list->string (reverse cur)) acc)))
-          ((char=? (car cs) ch)
-           (loop (cdr cs) '() (cons (list->string (reverse cur)) acc)))
-          (else (loop (cdr cs) (cons (car cs) cur) acc)))))
+  (split-many s (list->string (list ch))))
 
 ;; UTF-8 byte length of `s` — overlay spans are byte-based.
 (define (em--bytelen s)
@@ -1321,19 +1330,25 @@
       (else (em--latin1->hex raw)))))
 
 ;; Split a multipart body's LINES on its boundary → list of part strings.
+;; A boundary delimiter line always begins with "--", so only those lines get
+;; the (regex) trim + compare; the base64/text bulk — thousands of lines in a
+;; message with a large attachment — skips it. Without this guard the per-line
+;; trim ran two regexes on every line and dominated MIME parsing (seconds on a
+;; ~1 MB message), which is what froze indexing.
 (define (em--split-boundary body boundary)
   (let ((open (string-append "--" boundary))
         (close (string-append "--" boundary "--")))
     (let loop ((ls (em--split-char body #\newline)) (cur #f) (parts '()))
       (if (null? ls)
           (reverse (if cur (cons (em--join (reverse cur) "\n") parts) parts))
-          (let ((t (em--trim (em--trim-crlf (car ls)))))
+          (let* ((line (car ls))
+                 (t (and (starts-with? line "--") (em--trim (em--trim-crlf line)))))
             (cond
               ((equal? t close)
                (reverse (if cur (cons (em--join (reverse cur) "\n") parts) parts)))
               ((equal? t open)
                (loop (cdr ls) '() (if cur (cons (em--join (reverse cur) "\n") parts) parts)))
-              (cur (loop (cdr ls) (cons (car ls) cur) parts))
+              (cur (loop (cdr ls) (cons line cur) parts))
               (else (loop (cdr ls) #f parts))))))))   ; preamble
 
 ;; Flatten a raw message into leaf hashes ('headers 'raw 'section 'mime
@@ -1373,7 +1388,53 @@
   (decode-charset (em--cte->hex (hash-try-get leaf 'raw) (hash-try-get leaf 'cte))
                   (hash-try-get leaf 'charset)))
 
-;; Display body from MIME leaves: text/plain wins, text/html second.
+;; True when a text/plain part shows visible character loss its text/html
+;; sibling doesn't — the classic Outlook/Exchange case: a Windows-1252 plain
+;; part downgrades an emoji to a literal "?" (or our own decode yields U+FFFD),
+;; while the HTML alternative still carries it (e.g. `&#128522;`). We flip to
+;; HTML only when a loss marker ("?" or U+FFFD) is present in the plain text AND
+;; the HTML holds an emoji/pictograph codepoint that the plain text lacks. The
+;; trigger ranges are deliberately narrow — emoji supplementary planes plus the
+;; Misc-Symbols/Dingbats/stars block — and pointedly EXCLUDE General Punctuation
+;; (curly quotes, dashes, ellipsis, bullets), arrows and geometric shapes, which
+;; mailers routinely render straight in plain and typographic in HTML. So
+;; ordinary plain mail (smart quotes, accents, a real "?") stays on the plain
+;; part and its cleaner reader output. `plain`/`html` are the already rendered
+;; texts (or #f when that alternative is absent).
+
+;; Emoji / pictograph codepoint. Capped at U+1FAFF (end of Symbols & Pictographs
+;; Extended-A) so astral non-emoji — CJK Ext-B at U+20000+, math alphanumerics —
+;; aren't misread as emoji. `em--emoji-rx` is the SAME ranges as a regex, so the
+;; two stay in lockstep; keep them together if you touch either.
+(define (em--emoji-cp? cp)
+  (or (and (>= cp #x1F000) (<= cp #x1FAFF))   ; emoji & pictographs (astral)
+      (and (>= cp #x2600) (<= cp #x2BFF))))    ; misc symbols / dingbats / stars
+(define em--emoji-rx "[\\x{1F000}-\\x{1FAFF}\\x{2600}-\\x{2BFF}]")
+(define em--ufffd (list->string (list (integer->char 65533))))  ; the � char
+
+(define (em--plain-degraded? plain html)
+  (and plain html
+       ;; Two fast Rust-side gates first, so the overwhelmingly common case —
+       ;; no loss marker, or no emoji in the HTML — returns without building any
+       ;; per-char list. This runs once per message, including for EVERY message
+       ;; during a local index rebuild, so the cheap path must stay cheap.
+       (or (string-contains? plain "?")
+           (string-contains? plain em--ufffd))
+       (em--matches? em--emoji-rx html)
+       ;; Rare path: the HTML has an emoji and the plain part shows a loss
+       ;; marker. Flag as degraded unless the plain part actually carries that
+       ;; same emoji (then nothing was lost). Build the plain codepoint set once.
+       (let ((pset (let build ((cs (map char->integer (string->list plain))) (h (hash)))
+                     (if (null? cs) h (build (cdr cs) (hash-insert h (car cs) #t))))))
+         (let loop ((hs (string->list html)))
+           (cond ((null? hs) #f)
+                 ((let ((cp (char->integer (car hs))))
+                    (and (em--emoji-cp? cp) (not (hash-try-get pset cp))))
+                  #t)
+                 (else (loop (cdr hs))))))))
+
+;; Display body from MIME leaves: text/plain wins, text/html second — but a
+;; text/plain part with visible charset loss yields to its HTML sibling.
 (define (em--pick-body-mime leaves)
   (let ((plain (let loop ((ps leaves))
                  (cond ((null? ps) #f)
@@ -1387,7 +1448,10 @@
                             (equal? (hash-try-get (car ps) 'filename) ""))
                        (em--html->text (em--leaf-text (car ps))))
                       (else (loop (cdr ps)))))))
-    (or plain html "(no displayable body)")))
+    (cond ((em--plain-degraded? plain html) html)
+          (plain plain)
+          (html html)
+          (else "(no displayable body)"))))
 
 ;; Attachments from MIME leaves: (name mime approx-size section) per file.
 (define (em--atts-mime leaves)
@@ -1445,7 +1509,10 @@
                             (em--part-data (car ps)))
                        (em--html->text (em--part-data (car ps))))
                       (else (loop (cdr ps)))))))
-    (or plain html "(no displayable body)")))
+    (cond ((em--plain-degraded? plain html) html)
+          (plain plain)
+          (html html)
+          (else "(no displayable body)"))))
 
 ;; Attachments from REST leaves: (name mime size attachmentId) per file.
 (define (em--atts-json leaves)
@@ -3611,6 +3678,7 @@
 (define (em--do-switch name)
   (cond
     ((em--st 'syncing) (message "email: cannot switch accounts during a sync"))
+    ((em--st 'indexing) (message "email: cannot switch accounts during indexing — C-g cancels it"))
     ((em--st 'exporting) (message "email: cannot switch accounts during an export"))
     ((em--st 'caching) (message "email: cannot switch accounts during the offline cache"))
     ((em--st 'busy)    (message "email: cannot switch accounts while a request is in flight"))
@@ -4110,14 +4178,37 @@
   (let loop ((rows (sqlite-query db "SELECT id FROM mail" '())) (h (hash)))
     (if (null? rows) h (loop (cdr rows) (hash-insert h (car rows) #t)))))
 
+;; Body text for the SEARCH INDEX — deliberately NOT `em--pick-body-mime`. The
+;; viewer's picker eagerly runs the vendored reader-mode layout engine
+;; (`em--html->text`) on the HTML part of EVERY message, which averages ~0.9s
+;; and can take several SECONDS on one pathological message — fine once, for the
+;; message you're reading, but ruinous across a whole-archive index (it blocked
+;; the engine so hard C-g/`q` couldn't get through). The index only needs
+;; searchable words, not faithful layout, so: prefer the plain part, and fall
+;; back to the LIGHT regex strip (`em--html->text-basic`) for HTML-only mail.
+;; That drops per-message cost to a few ms, so index chunks stay short and the
+;; UI stays responsive.
+(define (em--index-body leaves)
+  (or (let loop ((ps leaves))
+        (cond ((null? ps) #f)
+              ((and (equal? (hash-try-get (car ps) 'mime) "text/plain")
+                    (equal? (hash-try-get (car ps) 'filename) ""))
+               (em--body-clean (em--leaf-text (car ps))))
+              (else (loop (cdr ps)))))
+      (let loop ((ps leaves))
+        (cond ((null? ps) "")
+              ((and (equal? (hash-try-get (car ps) 'mime) "text/html")
+                    (equal? (hash-try-get (car ps) 'filename) ""))
+               (em--html->text-basic (em--leaf-text (car ps))))
+              (else (loop (cdr ps)))))))
+
 ;; Parse one raw RFC 822 message into the row we index: decoded from/to/
-;; subject headers + the plain-text body (via the same MIME pipeline the
-;; viewer uses). `date` is the filename epoch (already local-agnostic).
+;; subject headers + the plain-text body. `date` is the filename epoch.
 (define (em--index-row id date raw)
   (let* ((sp (em--split-raw raw))
          (hs (em--parse-headers (car sp)))
          (leaves (em--mime-leaves raw ""))
-         (body (em--pick-body-mime leaves)))
+         (body (em--index-body leaves)))
     (list id
           (em--sanitize (em--decode-header (em--hdr hs "from")))
           (em--sanitize (em--decode-header (em--hdr hs "to")))
@@ -4127,43 +4218,111 @@
           ;; without a column filter still finds subject hits.
           (string-append (em--decode-header (em--hdr hs "subject")) "\n" body))))
 
+;; Indexing runs in timer-scheduled CHUNKS rather than one blocking loop. Each
+;; chunk parses up to `em--index-chunk-size` new messages, then yields via
+;; `run-with-timer`: control returns to the editor between chunks, so progress
+;; messages flush to *Messages*, the UI stays responsive, and C-g
+;; (`email-keyboard-quit`) can cancel it. Each chunk commits its own
+;; transaction, so a cancel — or a crash — leaves a valid partial index that a
+;; re-run resumes (the skip-existing pass picks up where it stopped).
+(define em--index-chunk-size 5)
+
+;; Close out a build: free the db handle + build state and report. Chunks commit
+;; their own transactions, so there is nothing to commit here.
+(define (em--index-finish note)
+  (let ((db (em--st 'index-db)))
+    (when (and db (> db 0)) (sqlite-close db)))
+  (let ((new (em--st 'index-new)) (total (em--st 'index-total)))
+    (em--st! 'indexing #f)
+    (em--st! 'index-db #f)
+    (em--st! 'index-files '())
+    (em--st! 'index-existing (hash))
+    (message (string-append "email: indexing " note " — " (number->string new)
+                            " new, " (number->string total) " total → "
+                            (em--index-db-file)))))
+
 (define (email-index)
   (em--load)
-  (let ((dir (em--index-source-dir)))
-    (if (not (file-directory? (path-join dir "cur")))
-        (message (string-append "email: no Maildir at " dir
-                                " — run M-x email-export-maildir first"))
-        (let ((db (em--index-open)))
-          (when (> db 0)
-            (message "email: indexing …")
-            (let* ((existing (em--index-existing db))
-                   (files (filter (lambda (f) (em--maildir-id f))
-                                  (list-directory (path-join dir "cur"))))
-                   (added 0))
-              ;; Wrap the inserts in one transaction — orders of magnitude
-              ;; faster than autocommit per row on a large archive.
-              (sqlite-exec db "BEGIN" '())
-              (let loop ((fs files) (n 0))
-                (if (null? fs)
-                    (begin
-                      (sqlite-exec db "COMMIT" '())
-                      (sqlite-close db)
-                      (message (string-append "email: index updated — " (number->string n)
-                                              " new, " (number->string (length files))
-                                              " total → " (em--index-db-file))))
-                    (let* ((path (car fs))
-                           (id (em--maildir-id path)))
-                      (if (or (not id) (hash-try-get existing id))
-                          (loop (cdr fs) n)
-                          (let* ((date (or (em--cap "^([0-9]+)\\." (basename path)) "0"))
-                                 (raw (read-file path))
-                                 (row (em--index-row id date raw)))
-                            (sqlite-exec db
-                                         "INSERT INTO mail(id,sender,recipients,subject,date,body) VALUES (?1,?2,?3,?4,?5,?6)"
-                                         row)
-                            (when (= 0 (modulo n 200))
-                              (message (string-append "email: indexing … " (number->string n))))
-                            (loop (cdr fs) (+ n 1)))))))))))))
+  (cond
+    ((em--st 'indexing)
+     (message "email: indexing already in progress — C-g cancels it"))
+    (else
+     (let ((dir (em--index-source-dir)))
+       (cond
+         ((not (file-directory? (path-join dir "cur")))
+          (message (string-append "email: no Maildir at " dir
+                                  " — run M-x email-export-maildir first")))
+         (else
+          (let ((db (em--index-open)))
+            (if (not (> db 0))
+                (message "email: cannot open index")
+                (let* ((existing (em--index-existing db))
+                       (files (filter (lambda (f) (em--maildir-id f))
+                                      (list-directory (path-join dir "cur")))))
+                  (em--st! 'index-db db)
+                  (em--st! 'index-files files)
+                  (em--st! 'index-existing existing)
+                  (em--st! 'index-new 0)
+                  (em--st! 'index-total (length files))
+                  (em--st! 'indexing 'run)
+                  (message (string-append "email: indexing started — "
+                                          (number->string (length files))
+                                          " messages in " dir))
+                  (run-with-timer 0 "em--index-chunk"))))))))))
+
+;; One chunk of the running build — fired by `run-with-timer`, reschedules
+;; itself until the file list drains or a cancel is seen. Registered as a
+;; command so the timer can dispatch it by name.
+(define (em--index-chunk)
+  (cond
+    ((equal? (em--st 'indexing) 'cancel) (em--index-finish "cancelled"))
+    ((null? (em--st 'index-files)) (em--index-finish "finished"))
+    (else
+     (let ((db (em--st 'index-db))
+           (existing (em--st 'index-existing))
+           (total (em--st 'index-total)))
+       (sqlite-exec db "BEGIN" '())
+       (let loop ((fs (em--st 'index-files)) (new (em--st 'index-new)) (k 0))
+         (cond
+           ((null? fs)
+            (sqlite-exec db "COMMIT" '())
+            (em--st! 'index-files '())
+            (em--st! 'index-new new)
+            (em--index-finish "finished"))
+           ((>= k em--index-chunk-size)
+            (sqlite-exec db "COMMIT" '())
+            (em--st! 'index-files fs)
+            (em--st! 'index-new new)
+            (message (string-append "email: indexing … "
+                                    (number->string (- total (length fs)))
+                                    "/" (number->string total)))
+            (run-with-timer 0 "em--index-chunk"))
+           (else
+            (let* ((path (car fs)) (id (em--maildir-id path)))
+              (if (or (not id) (hash-try-get existing id))
+                  (loop (cdr fs) new k)                       ; skip: cheap, doesn't fill the chunk
+                  (let* ((date (or (em--cap "^([0-9]+)\\." (basename path)) "0"))
+                         (raw (read-file path))
+                         (row (em--index-row id date raw)))
+                    (sqlite-exec db
+                                 "INSERT INTO mail(id,sender,recipients,subject,date,body) VALUES (?1,?2,?3,?4,?5,?6)"
+                                 row)
+                    (loop (cdr fs) (+ new 1) (+ k 1)))))))))))) ; only new inserts fill the chunk
+
+;; M-x email-index-cancel (and C-g) — stop a running build at the next chunk.
+(define (email-index-cancel)
+  (if (equal? (em--st 'indexing) 'run)
+      (begin (em--st! 'indexing 'cancel)
+             (message "email: indexing will stop after the current batch"))
+      (message "email: no indexing running")))
+
+;; C-g in an email buffer: stop a running index or export (whichever is live),
+;; otherwise behave as the ordinary keyboard-quit.
+(define (email-keyboard-quit)
+  (cond
+    ((equal? (em--st 'indexing) 'run) (email-index-cancel))
+    ((equal? (em--st 'exporting) 'run) (email-export-cancel))
+    (else (keyboard-quit))))
 
 ;; `email-search-local` — a BM25-ranked FTS5 query over the local index. The
 ;; query is Gmail-ish sugar mapped to FTS5: `from:x` / `subject:y` become
@@ -4645,8 +4804,10 @@
 (define-key "email-list-mode" "shift-l" 'email-login)
 (define-key "email-list-mode" "shift-o" 'email-outbox)
 (define-key "email-list-mode" "q"       'email-list-quit)
+(define-key "email-list-mode" "ctrl-g"  'email-keyboard-quit)
 
 (define-key "email-view-mode" "q"       'email-view-quit)
+(define-key "email-view-mode" "ctrl-g"  'email-keyboard-quit)
 (define-key "email-view-mode" "enter"   'email-view-follow)
 (define-key "email-view-mode" "mouse-1" 'email-view-follow)
 (define-key "email-view-mode" "n"       'email-view-next)
@@ -4739,6 +4900,9 @@
 (register-command "email-export-maildir")
 (register-command "email-export-cancel")
 (register-command "email-index")
+(register-command "em--index-chunk")
+(register-command "email-index-cancel")
+(register-command "email-keyboard-quit")
 (register-command "email-search-local")
 (register-command "email-list-open")
 (register-command "email-list-reply")
