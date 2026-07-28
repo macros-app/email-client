@@ -109,12 +109,14 @@
    'max-uid      0       ; IMAP incremental high-water mark
    'me           ""      ; the account address
    'view         '()     ; ids currently rendered in *email*, display order
-   'view-offset  3       ; buffer line of the first message row
    'view-atts    '()     ; attachments of the message shown in *email-view*
    'view-lines   '()     ; rendered lines of *email-view* (link hit-testing)
    'view-links   '()     ; (number . url) alist from the message's link footer
    'current      #f      ; id shown in *email-view*
    'view-raw     #f      ; #t while *email-view* shows the raw RFC 822 source
+   'view-visual  #f      ; *email-view* selection: #f | 'char | 'line
+   'view-vline-a 0       ; linewise selection: anchor line
+   'view-vline-h 0       ; linewise selection: head line
    'search-ids   #f      ; ids of the active server search, or #f = inbox view
    'folder       #f      ; display name of the pinned folder/search, #f = inbox
    'ops          '()     ; queued REST op thunks (one http chain at a time)
@@ -1246,16 +1248,21 @@
   (let* ((m (replace-regexp-in-string "(\\[[0-9]+\\])"
                                       (string-append em--soh-str "$1" em--soh-str) line))
          (pieces (em--split-char m em--soh)))       ; text, "[N]", text, "[N]", …
-    (let loop ((ps pieces) (i 0) (acc '()))
+    ;; The column is the running byte width of the pieces before this one, NOT
+    ;; a re-search for the token: `string-match` finds the FIRST occurrence, so
+    ;; a line that repeats a marker ("… [3] … [3] …") reported the first one's
+    ;; column twice and never the second's — the later link was unclickable and
+    ;; its overlay painted on top of the earlier one.
+    (let loop ((ps pieces) (i 0) (bc 0) (acc '()))
       (cond
         ((null? ps) (reverse acc))
-        ((= 0 (modulo i 2)) (loop (cdr ps) (+ i 1) acc))
+        ((= 0 (modulo i 2))
+         (loop (cdr ps) (+ i 1) (+ bc (em--bytelen (car ps))) acc))
         (else
          (let* ((tok (car ps))                       ; e.g. "[12]"
-                (bc  (string-match (regexp-quote tok) line))
                 (n   (string->number (substring tok 1 (- (string-length tok) 1)))))
-           (loop (cdr ps) (+ i 1)
-                 (if (and (>= bc 0) n) (cons (cons bc n) acc) acc))))))))
+           (loop (cdr ps) (+ i 1) (+ bc (em--bytelen tok))
+                 (if n (cons (cons bc n) acc) acc))))))))
 
 ;; Given a line's markers (sorted by column) and the cursor byte column, pick
 ;; the link at or after the column — the cursor on a link's text lands on its
@@ -2753,7 +2760,21 @@
   (let ((a (em--cap "<([^>]+)>" s)))
     (if a a (em--trim s))))
 
-;; Render *email*. `where` — 'top, 'keep, or a line number (feeds semantics).
+;; Buffer line of `id` in a rendered list, from the renderer's own line→id map.
+;; Rows are NOT one-per-message — a local-search hit adds a snippet
+;; continuation line — so scan the map rather than doing arithmetic on the
+;; message's index. Rows are contiguous from the first one, so the first gap
+;; ends the list.
+(define (em--row-of-id rowmap id)
+  (let loop ((i 3))
+    (let ((row (hash-try-get rowmap i)))
+      (cond ((not row) #f)
+            ((equal? row id) i)
+            (else (loop (+ i 1)))))))
+
+;; Render *email*. `where` — 'keep holds the cursor line (feeds semantics), a
+;; number is that line, a string is the row showing that message id, and
+;; anything else ('top) lands on the first message.
 (define (em--list-render where)
   (let* ((prev-line (buffer-line))
          (flat-ids (em--visible-ids))
@@ -2810,6 +2831,7 @@
             (overlay-set-faces (reverse ospans))
             (goto-line (cond ((and (equal? where 'keep) already? (>= prev-line 3)) prev-line)
                              ((number? where) where)
+                             ((string? where) (or (em--row-of-id rowmap where) 3))
                              (else 3))))
           (let* ((entry (car rest))
                  (id (car entry))
@@ -2888,7 +2910,7 @@
 
 ;; ── view buffer ─────────────────────────────────────────────────────────────
 (define em--view-help
-  "  ? menu · enter follow link · n/p next/prev · R/E reply/all · A archive · D trash · W save attachment · \\ raw · b gmail · q back")
+  "  ? menu · enter follow link · v/V select · y copy · n/p next/prev · R/E reply/all · A archive · D trash · W save attachment · \\ raw · b gmail · q back")
 
 ;; Read the normalized store file → (head-lines body-lines attachments).
 (define (em--read-message id)
@@ -2918,6 +2940,7 @@
     (when msg
       (em--st! 'current id)
       (em--st! 'view-raw #f)   ; rendering the reader view leaves raw mode
+      (em--st! 'view-visual #f) ; …and drops any selection with the old text
       (em--st! 'view-atts (nth msg 2))
       (let* ((head (nth msg 0))
              (atts (nth msg 2))
@@ -3850,10 +3873,20 @@
                          (list "D" "Trash"         'email-view-trash)
                          (list "L" "Label +/-…"    'email-view-label)
                          (list "m" "Mute"          'email-view-mute))
+                   (list "Copy"
+                         (list "y" "Copy selection/line" 'email-view-yank)
+                         (list "Y" "Copy body"        'email-view-copy-body)
+                         (list "c" "Copy whole message" 'email-view-copy-all)
+                         (list "v" "Select (charwise)" 'email-view-visual)
+                         (list "V" "Select (linewise)" 'email-view-visual-line)
+                         (list "a" "Select all"       'email-view-select-all))
                    (list "Attachments"
                          (list "W" "Save attachment…" 'email-view-save-attachment))
                    (list "Patch / git"
-                         (list "p" "git am (apply)"   'email-view-git-am)
+                         ;; NOT "p": the Message column already claims it, and
+                         ;; the popup takes the first row whose key matches —
+                         ;; so this row was unreachable.
+                         (list "g" "git am (apply)"   'email-view-git-am)
                          (list "3" "git am --3way"    'email-view-git-am-3way)
                          (list "z" "git am --abort"   'email-view-git-am-abort)
                          (list "P" "Save .patch…"     'email-view-save-patch))
@@ -4423,14 +4456,13 @@
 
 ;; view-buffer commands
 (define (email-view-quit)
-  (let* ((cur (em--st 'current))
-         (view (em--st 'view))
-         (line (let loop ((xs view) (i 0))
-                 (cond ((null? xs) 'top)
-                       ((equal? (car xs) cur) (+ i (em--st 'view-offset)))
-                       (else (loop (cdr xs) (+ i 1)))))))
+  ;; Hand the renderer the message id, not a line: `view-offset + index`
+  ;; assumed exactly one row per message, so `q` landed on the wrong row in any
+  ;; list with snippet continuation lines (every local-search result).
+  (let ((cur (em--st 'current)))
     (em--st! 'current #f)
-    (em--list-render line)))
+    (em--st! 'view-visual #f)
+    (em--list-render (if (string? cur) cur 'top))))
 
 (define (em--view-step dir)
   (let* ((view (em--st 'view))
@@ -4500,6 +4532,214 @@
         (open-url (string-append "https://mail.google.com/mail/u/0/#all/" id))
         (message "email: no message shown"))))
 
+;; ── selecting and copying text in *email-view* ──────────────────────────────
+;; *email-view* is a "special" (read-only) buffer, and the editor only ever
+;; consults a `<style>-normal:<major>` overlay for those — never an
+;; `evil-visual:` one, whatever modal state you are in. So evil's own Visual
+;; state can't reach this buffer and the view runs its own two-mode selection
+;; on top of the plain region primitives:
+;;
+;;   charwise (`v`) — `set-mark` arms the region and every ordinary motion
+;;     extends it for free, because the editor's `goto` routes through
+;;     `select_to` while the mark is active. Nothing to track per motion.
+;;   linewise (`V`) — whole lines can't ride on point alone, so the anchor and
+;;     head LINES live in state and each line motion recomputes the span with
+;;     `set-selections`, which (unlike `set-region`) also carries the direction,
+;;     so the cursor sits on the end you are actually moving.
+;;
+;; `y` copies to the kill ring AND the system clipboard — `kill-ring-save`
+;; mirrors both — so it pastes into any other app. Careful: `goto-char` and
+;; `goto-line` are `move_to`, not `goto`, so they COLLAPSE a region; anything
+;; that jumps by absolute position has to extend with `select-to` instead.
+
+(define (em--view-visual) (em--st 'view-visual))
+(define (em--view-visual-clear!) (em--st! 'view-visual #f))
+(define (em--view-charwise?) (equal? (em--view-visual) 'char))
+(define (em--view-linewise?) (equal? (em--view-visual) 'line))
+
+;; Last line index of the buffer (0-based), clamped at 0 for an empty buffer.
+(define (em--view-last-line) (max 0 (- (line-count) 1)))
+
+;; Paint the linewise span: whole lines from the anchor line to the head line,
+;; including the head line's newline so a paste lands as complete lines (vim
+;; linewise). Anchor first / head second so `set-selections` records the
+;; direction and extending upward leaves the cursor at the TOP of the block.
+(define (em--view-vline-apply)
+  (let* ((a  (em--st 'view-vline-a))
+         (h  (em--st 'view-vline-h))
+         (lo (min a h))
+         (hi (max a h))
+         (s  (line-start-of-line lo))
+         (e  (min (point-max) (+ 1 (line-end-pos (line-start-of-line hi))))))
+    (if (>= h a) (set-selections (list s e)) (set-selections (list e s)))))
+
+;; Move the linewise head by `n` lines / to an absolute line, then repaint.
+(define (em--view-vline-goto l)
+  (em--st! 'view-vline-h (max 0 (min (em--view-last-line) l)))
+  (em--view-vline-apply))
+(define (em--view-vline-move n)
+  (em--view-vline-goto (+ (em--st 'view-vline-h) n)))
+
+;; Jump point to `pos`. A charwise selection has to extend with `select-to`,
+;; since `goto-char` would collapse it.
+(define (em--view-move-to pos)
+  (if (em--view-charwise?) (select-to pos) (goto-char pos)))
+
+;; `v` — charwise selection from point; press again to drop it. Ordinary
+;; motions (j/k/w/b/h/l/…) extend it with no further bookkeeping.
+(define (email-view-visual)
+  (if (em--view-charwise?)
+      (email-view-cancel)
+      (begin
+        (em--st! 'view-visual 'char)
+        (set-mark)
+        (message "email: -- VISUAL -- · y copy · V linewise · escape cancel"))))
+
+;; `V` (and helix `x`) — linewise selection; press again to drop it.
+(define (email-view-visual-line)
+  (if (em--view-linewise?)
+      (email-view-cancel)
+      (let ((l (line-of-pos (point))))
+        (em--st! 'view-visual 'line)
+        (em--st! 'view-vline-a l)
+        (em--st! 'view-vline-h l)
+        (em--view-vline-apply)
+        (message "email: -- VISUAL LINE -- · y copy · v charwise · escape cancel"))))
+
+;; `escape` — drop the selection and return to plain reading.
+(define (email-view-cancel)
+  (em--view-visual-clear!)
+  (keyboard-quit))
+
+;; `?` menu → Copy → Select all — the whole message, ready to yank.
+(define (email-view-select-all)
+  (em--st! 'view-visual 'char)
+  (mark-whole-buffer)
+  (message "email: whole message selected — y copies it"))
+
+;; `y` — copy the selection to the kill ring and the system clipboard. With no
+;; selection it copies the current line, so `y` always does something useful
+;; (a special buffer has no operator-pending state, so `y` can't wait for a
+;; motion the way vim's `yy`/`yw` do — `Y` is the explicit line yank).
+(define (email-view-yank)
+  (if (not (region-active?))
+      (email-view-yank-line)
+      (let ((n (string-length (region-text)))
+            (s (region-beginning)))
+        (kill-ring-save)
+        (goto-char s)                 ; vim: the cursor lands on the start
+        (em--view-visual-clear!)
+        (message (string-append "email: copied " (number->string n)
+                                " characters to the clipboard")))))
+
+;; `Y` — copy the current line (with its newline), whatever is selected.
+(define (email-view-yank-line)
+  (let* ((p (point))
+         (s (line-start-pos p))
+         (e (min (point-max) (+ 1 (line-end-pos p)))))
+    (set-region s e)
+    (kill-ring-save)
+    (goto-char s)
+    (em--view-visual-clear!)
+    (message "email: line copied to the clipboard")))
+
+;; The body lines of the message on screen. The renderer lays the view out as
+;; headers · attachments · help · "" · body, so the body starts two lines past
+;; the help marker. Empty in the raw view, which keeps no line map.
+(define (em--view-body-lines)
+  (let loop ((ls (em--st 'view-lines)))
+    (cond ((null? ls) '())
+          ((equal? (car ls) em--view-help)
+           (if (null? (cdr ls)) '() (cdr (cdr ls))))
+          (else (loop (cdr ls))))))
+
+;; Copy `lines` (or the buffer, when there is no line map) to the clipboard.
+(define (em--view-copy-lines lines what)
+  (let ((text (if (null? lines) (buffer-string) (em--join lines "\n"))))
+    (if (equal? (em--trim text) "")
+        (message "email: nothing to copy")
+        (begin
+          (clipboard-set text)
+          (em--view-visual-clear!)
+          (message (string-append "email: " what " copied to the clipboard"))))))
+
+;; `g y` — the message body alone: no headers, no attachment list, and never
+;; the injected keybinding help line (which is what you'd otherwise paste).
+(define (email-view-copy-body)
+  (em--view-copy-lines (em--view-body-lines) "message body"))
+
+;; `g a` — the whole message as rendered, minus the help line.
+(define (email-view-copy-all)
+  (em--view-copy-lines
+   (filter (lambda (l) (not (equal? l em--view-help))) (em--st 'view-lines))
+   "whole message"))
+
+;; --- motion that knows about the selection ---------------------------------
+;; In linewise mode a motion walks the head LINE (so the block grows by whole
+;; lines); otherwise the plain editor motion runs, which already extends a
+;; charwise region on its own.
+
+(define (email-view-down)
+  (if (em--view-linewise?) (em--view-vline-move 1) (next-line)))
+(define (email-view-up)
+  (if (em--view-linewise?) (em--view-vline-move -1) (previous-line)))
+
+(define (email-view-top)
+  (cond ((em--view-linewise?) (em--view-vline-goto 0))
+        ((em--view-charwise?) (select-to 0))
+        (else (evil-goto-first-line))))
+(define (email-view-bottom)
+  (cond ((em--view-linewise?) (em--view-vline-goto (em--view-last-line)))
+        ((em--view-charwise?) (select-to (point-max)))
+        (else (evil-goto-last-line))))
+
+;; Half a window of lines, from what's actually on screen (>= 1).
+(define (em--view-half-page)
+  (let ((v (visible-lines)))
+    (max 1 (quotient (- (nth v 1) (nth v 0)) 2))))
+
+;; `C-d` / `C-u`. The editor's own half-page scroll is `move_to`, so it would
+;; drop the selection — with one armed, walk by lines instead.
+(define (email-view-half-down)
+  (cond ((em--view-linewise?) (em--view-vline-move (em--view-half-page)))
+        ((em--view-charwise?)
+         (select-to (line-start-of-line (+ (line-of-pos (point)) (em--view-half-page)))))
+        (else (evil-scroll-down))))
+(define (email-view-half-up)
+  (cond ((em--view-linewise?) (em--view-vline-move (- 0 (em--view-half-page))))
+        ((em--view-charwise?)
+         (select-to (line-start-of-line (max 0 (- (line-of-pos (point))
+                                                  (em--view-half-page))))))
+        (else (evil-scroll-up))))
+
+;; `^` — first non-blank on the line (vim), extending a charwise selection.
+(define (em--view-first-non-blank-pos p)
+  (let* ((s (line-start-pos p))
+         (off (string-match "[^ \t]" (buffer-substring s (line-end-pos p)))))
+    (if (>= off 0) (+ s off) s)))
+(define (email-view-first-non-blank)
+  (em--view-move-to (em--view-first-non-blank-pos (point))))
+
+;; `{` / `}` — previous / next blank line: paragraph motion, which in a reader
+;; view is the jump you actually want. Reads the rendered line list, so it is
+;; free; the raw view has none and falls back to the buffer ends.
+(define (em--view-paragraph dir)
+  (let ((lines (em--st 'view-lines))
+        (cur   (line-of-pos (point))))
+    (if (null? lines)
+        (if (> dir 0) (email-view-bottom) (email-view-top))
+        (let ((n (length lines)))
+          (let loop ((i (+ cur dir)))
+            (cond ((< i 0) (email-view-top))
+                  ((>= i n) (email-view-bottom))
+                  ((equal? (em--trim (nth lines i)) "")
+                   (if (em--view-linewise?)
+                       (em--view-vline-goto i)
+                       (em--view-move-to (line-start-of-line i))))
+                  (else (loop (+ i dir)))))))))
+(define (email-view-paragraph-next) (em--view-paragraph 1))
+(define (email-view-paragraph-prev) (em--view-paragraph -1))
+
 ;; ── raw source view ─────────────────────────────────────────────────────────
 ;; `email-view-raw` toggles *email-view* between the rendered reader view and
 ;; the message's raw RFC 822 source (headers + MIME parts verbatim). The raw is
@@ -4513,6 +4753,7 @@
   (em--st! 'current id)
   (em--st! 'view-lines '())    ; no link/marker hit-testing in raw mode
   (em--st! 'view-links '())
+  (em--st! 'view-visual #f)
   (let* ((raw (replace-regexp-in-string "\r" "" (decode-charset hex "iso-8859-1")))
          (text (string-append "Raw source — " id "\n" em--view-raw-help "\n\n" raw)))
     (render-buffer "*email-view*" "email-view-mode" text
@@ -5165,7 +5406,9 @@
   (cond
     ((equal? (em--st 'indexing) 'run) (email-index-cancel))
     ((equal? (em--st 'exporting) 'run) (email-export-cancel))
-    (else (keyboard-quit))))
+    ;; `keyboard-quit` collapses the region, so drop the view's matching
+    ;; selection state with it — otherwise `v` would think one is still armed.
+    (else (em--st! 'view-visual #f) (keyboard-quit))))
 
 ;; `email-search-local` — a query over the local index. The query is Gmail-ish
 ;; sugar split into two halves: TEXT terms (bare words, and `from:`/`to:`/
@@ -5759,6 +6002,23 @@
 (define-key "email-view-mode" "\\"      'email-view-raw)
 (define-key "email-view-mode" "t"       'email-status)
 
+;; Selecting and copying. These live in the BASE keymap, not the modal overlay,
+;; so they work under plain Emacs too — a special buffer treats every plain key
+;; as a command, so `v`/`y` are free there whether or not evil is on. (The
+;; modal overlay is consulted first and doesn't bind them, so it falls through
+;; to here.) `M-w`, `C-space` and `C-g` keep their Emacs meanings.
+(define-key "email-view-mode" "v"       'email-view-visual)
+(define-key "email-view-mode" "shift-v" 'email-view-visual-line)
+(define-key "email-view-mode" "x"       'email-view-visual-line) ; helix `x`
+(define-key "email-view-mode" "y"       'email-view-yank)
+(define-key "email-view-mode" "shift-y" 'email-view-yank-line)
+(define-key "email-view-mode" "escape"  'email-view-cancel)
+(define-key "email-view-mode" "alt-w"   'email-view-yank)
+(define-key "email-view-mode" "g y"     'email-view-copy-body)
+(define-key "email-view-mode" "g a"     'email-view-copy-all)
+(define-key "email-view-mode" "}"       'email-view-paragraph-next)
+(define-key "email-view-mode" "{"       'email-view-paragraph-prev)
+
 (define-key "email-compose-mode" "ctrl-c ctrl-c" 'email-compose-send)
 (define-key "email-compose-mode" "ctrl-c ctrl-k" 'email-compose-cancel)
 (define-key "email-compose-mode" "ctrl-c ctrl-l" 'email-compose-send-later)
@@ -5793,7 +6053,9 @@
    (define-key mode "ctrl-n" 'next-line)
    (define-key mode "ctrl-p" 'previous-line)
    (define-key mode "ctrl-v" 'evil-scroll-down)
-   (define-key mode "meta-v" 'evil-scroll-up)
+   ;; The editor spells the Meta modifier "alt-" (see `chord_string`); "meta-v"
+   ;; matched no keystroke, so M-v — the Emacs page-up — did nothing at all.
+   (define-key mode "alt-v"  'evil-scroll-up)
    (define-key mode "ctrl-d" 'evil-scroll-down)
    (define-key mode "ctrl-u" 'evil-scroll-up)
    (define-key mode "space"  'evil-scroll-down)
@@ -5801,6 +6063,18 @@
    (define-key mode "end"    'end-of-buffer))
  (list "email-list-mode" "email-view-mode" "email-outbox-mode"
        "email-contacts-mode" "email-unified-mode"))
+
+;; …then the view re-binds the motions a selection has to follow: the arrows
+;; and half-page keys walk whole lines while a linewise selection is armed, and
+;; the editor's own `C-d`/`C-u` are `move_to`, so they'd drop a selection.
+(define-key "email-view-mode" "down"   'email-view-down)
+(define-key "email-view-mode" "up"     'email-view-up)
+(define-key "email-view-mode" "ctrl-n" 'email-view-down)
+(define-key "email-view-mode" "ctrl-p" 'email-view-up)
+(define-key "email-view-mode" "ctrl-d" 'email-view-half-down)
+(define-key "email-view-mode" "ctrl-u" 'email-view-half-up)
+(define-key "email-view-mode" "home"   'email-view-top)
+(define-key "email-view-mode" "end"    'email-view-bottom)
 
 ;; Modal (evil + helix) overlays: vim motion plus the mode's own keys.
 (for-each
@@ -5813,13 +6087,31 @@
      (define-key km "g g"     'evil-goto-first-line)
      (define-key km "shift-g" 'email-sync)
      (define-key km "g r"     'email-list-refresh))
+   ;; The reader gets the full vim/helix motion set, since you read and select
+   ;; in it like a file. Every motion here either goes through the editor's
+   ;; `goto` (which extends an armed region on its own) or is a view wrapper
+   ;; that extends explicitly — so `v`/`V` + motion highlights, and `y` copies.
    (let ((km (string-append prefix "email-view-mode")))
-     (define-key km "j"       'next-line)
-     (define-key km "k"       'previous-line)
-     (define-key km "ctrl-d"  'evil-scroll-down)
-     (define-key km "ctrl-u"  'evil-scroll-up)
-     (define-key km "g g"     'evil-goto-first-line)
-     (define-key km "shift-g" 'evil-goto-last-line))
+     (define-key km "j"       'email-view-down)
+     (define-key km "k"       'email-view-up)
+     (define-key km "h"       'backward-char)
+     (define-key km "l"       'forward-char)
+     (define-key km "w"       'forward-word-start)
+     (define-key km "b"       'backward-word)
+     (define-key km "e"       'evil-forward-word-end)
+     (define-key km "0"       'move-beginning-of-line)
+     (define-key km "$"       'move-end-of-line)
+     (define-key km "^"       'email-view-first-non-blank)
+     (define-key km "}"       'email-view-paragraph-next)
+     (define-key km "{"       'email-view-paragraph-prev)
+     (define-key km "ctrl-d"  'email-view-half-down)
+     (define-key km "ctrl-u"  'email-view-half-up)
+     (define-key km "g g"     'email-view-top)
+     (define-key km "shift-g" 'email-view-bottom)
+     ;; `b` and `l` are word-back / right here, so the two mode keys they
+     ;; shadow move to their shifted twins — the evil-collection convention.
+     (define-key km "shift-b" 'email-view-browse)
+     (define-key km "shift-l" 'email-view-label))
    (let ((km (string-append prefix "email-outbox-mode")))
      (define-key km "j"       'next-line)
      (define-key km "k"       'previous-line)
@@ -5918,3 +6210,20 @@
 (register-command "email-view-browse")
 (register-command "email-view-raw")
 (register-command "email-status")
+(register-command "email-view-visual")
+(register-command "email-view-visual-line")
+(register-command "email-view-cancel")
+(register-command "email-view-select-all")
+(register-command "email-view-yank")
+(register-command "email-view-yank-line")
+(register-command "email-view-copy-body")
+(register-command "email-view-copy-all")
+(register-command "email-view-down")
+(register-command "email-view-up")
+(register-command "email-view-top")
+(register-command "email-view-bottom")
+(register-command "email-view-half-down")
+(register-command "email-view-half-up")
+(register-command "email-view-first-non-blank")
+(register-command "email-view-paragraph-next")
+(register-command "email-view-paragraph-prev")

@@ -229,6 +229,9 @@ On systems without the `security` CLI they fall back to chmod-600 files
 | `U` / `*` | unread / star | `W` | save attachment | `C-c C-t` | menu |
 | `l` / `m` | label / mute | `l` / `m` | label / mute | `M-i` | complete address |
 | `z` / `Z` | snooze / unsnooze | `b` / `q` | Gmail web / back | | |
+| | | `v` / `V` | select char / line | | |
+| | | `y` / `Y` | copy selection / line | | |
+| | | `g y` / `g a` | copy body / message | | |
 | `T` | toggle threading | | | | |
 | `s` / `/` | server / local search | | | | |
 | `f` / `b` | folders / saved searches | | | | |
@@ -242,13 +245,67 @@ nothing requires memorizing a key. Reply-all (`E`) addresses the original
 sender and Cc's every other recipient of the message, minus you.
 
 Evil/helix normal-state motion (`j`/`k`/`gg`/`C-d`/`C-u`) works in both
-read-only buffers. Attach files with `Attach: /path/to/file` header lines in
+read-only buffers, and the message view gets the full set — see
+[Selecting and copying text](#selecting-and-copying-text). Attach files with
+`Attach: /path/to/file` header lines in
 the compose buffer. `s` takes Gmail's query syntax on both backends
 (REST `q=` / IMAP `X-GM-RAW`); an empty query returns to the inbox. `f` opens
 a magit-style folder popup — Inbox, Unread, Starred, Sent, All Mail, Trash,
 or an ad-hoc search — and `i` jumps straight back to the inbox. The list
 header shows the active account (when more than one is configured), its
 address, auth method, and any queued flag ops.
+
+## Selecting and copying text
+
+An open message is text you can highlight and yank to the **system clipboard**,
+so it pastes into any other app. `y` mirrors to the kill ring as well, so `C-y`
+inside the editor works too.
+
+| key | |
+|---|---|
+| `v` | start a charwise selection at point (press again to drop it) |
+| `V` / `x` | select whole lines (`x` is the helix spelling) |
+| `y` | copy the selection — or the current line when nothing is selected |
+| `Y` | copy the current line, whatever is selected |
+| `g y` | copy the message **body** — no headers, no attachment list |
+| `g a` | copy the whole message as rendered |
+| `escape` / `C-g` | drop the selection |
+| `C-space` / `M-w` | Emacs set-mark / copy, as everywhere else |
+| shift-click / shift-drag | extend the selection from point to the pointer |
+
+A plain click in the view is the *follow link* key, so it can't start a
+selection — put point where you want the anchor, then shift-click or shift-drag
+to the other end (the view autoscrolls if you drag past the edge).
+
+Start a selection and **every motion extends it**:
+
+| | |
+|---|---|
+| `h` `j` `k` `l` | left / down / up / right |
+| `w` `b` `e` | word forward / back / end |
+| `0` `^` `$` | line start / first non-blank / line end |
+| `{` `}` | previous / next blank line (paragraph) |
+| `g g` `G` | top / bottom |
+| `C-d` `C-u` | half a screen down / up |
+| `C-v` `M-v` `space` | page down / up / down |
+
+The motion keys above are the evil/helix overlay, so they need `(evil-mode)` or
+`(helix-mode)`. `v` `V` `x` `y` `Y` `g y` `g a` and `escape` are in the view's
+own keymap and work with plain Emacs keys too — the arrows, `C-n`/`C-p`,
+`C-v`/`M-v` and `C-space`/`M-w` extend and copy exactly the same way.
+
+Because `b` and `l` become *word-back* and *right* under the modal overlay, the
+two mode keys they shadow move to their shifted twins there: `B` opens the
+message in Gmail and `L` edits labels (the evil-collection convention). Without
+evil/helix, `b` and `l` keep their plain meanings.
+
+Everything is in the `?` menu too, under **Copy** — including *Select all*.
+
+Two details worth knowing: a linewise selection covers whole lines including
+the trailing newline, so pasting lands them as lines; and `y` has no
+operator-pending state to hang a motion off (the view is a read-only buffer
+driven by its own keymap), so `yw`/`yy` aren't spellable — use `v` + motion +
+`y`, or `Y` for the line.
 
 ## Live vs. offline mode
 
