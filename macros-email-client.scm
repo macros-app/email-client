@@ -1242,12 +1242,31 @@
               (loop (cdr ls) #t out)
               (loop (cdr ls) blank? (cons (car ls) out)))))))
 
-;; Every "[N]" marker on `line` as (byte-col . number), left to right — the
-;; hit-test data for following a link at point.
-(define (emw--line-markers line)
-  (let* ((m (replace-regexp-in-string "(\\[[0-9]+\\])"
+;; A followable token: an HTML body's "[N]" marker, or a bare http(s) URL —
+;; text/plain mail carries no markers and no link footer, so the URL sitting
+;; in the prose IS the link. The character class stops at whitespace and at
+;; the delimiters that bracket a URL in prose; sentence punctuation glued to
+;; the tail is trimmed below (a URL may legitimately end in "/").
+(define em--target-rx
+  "((?:\\[[0-9]+\\])|(?:https?://[^\\s\"'<>()\\[\\]]+))")
+
+(define (em--url-trim u)
+  (let loop ((u u))
+    (let ((n (string-length u)))
+      (if (and (> n 0) (member (substring u (- n 1) n) '("." "," ";" ":" "!" "?")))
+          (loop (substring u 0 (- n 1)))
+          u))))
+
+;; Every followable target on `line` as (start-byte end-byte url), left to
+;; right — the hit-test data for following a link at point, and the spans the
+;; view paints in the link face. `links` is the message's (number . url)
+;; footer map, used to resolve a marker; a marker with no footer entry still
+;; reports (with url #f) so it paints and reports "no link here" rather than
+;; silently picking a neighbour.
+(define (em--line-targets line links)
+  (let* ((m (replace-regexp-in-string em--target-rx
                                       (string-append em--soh-str "$1" em--soh-str) line))
-         (pieces (em--split-char m em--soh)))       ; text, "[N]", text, "[N]", …
+         (pieces (em--split-char m em--soh)))       ; text, tok, text, tok, …
     ;; The column is the running byte width of the pieces before this one, NOT
     ;; a re-search for the token: `string-match` finds the FIRST occurrence, so
     ;; a line that repeats a marker ("… [3] … [3] …") reported the first one's
@@ -1259,19 +1278,25 @@
         ((= 0 (modulo i 2))
          (loop (cdr ps) (+ i 1) (+ bc (em--bytelen (car ps))) acc))
         (else
-         (let* ((tok (car ps))                       ; e.g. "[12]"
-                (n   (string->number (substring tok 1 (- (string-length tok) 1)))))
+         (let* ((tok (car ps))                       ; "[12]" or "https://…"
+                (t (if (starts-with? tok "[")
+                       (let ((n (string->number (substring tok 1 (- (string-length tok) 1)))))
+                         (and n (list bc (+ bc (em--bytelen tok)) (em--aget links n))))
+                       (let ((u (em--url-trim tok)))
+                         (and (> (string-length u) 0)
+                              (list bc (+ bc (em--bytelen u)) u))))))
            (loop (cdr ps) (+ i 1) (+ bc (em--bytelen tok))
-                 (if n (cons (cons bc n) acc) acc))))))))
+                 (if t (cons t acc) acc))))))))
 
-;; Given a line's markers (sorted by column) and the cursor byte column, pick
-;; the link at or after the column — the cursor on a link's text lands on its
-;; trailing [N] — falling back to the last marker on the line.
-(define (emw--pick-marker markers col)
-  (let loop ((ms markers) (fallback (cdr (car markers))))
-    (cond ((null? ms) fallback)
-          ((>= (car (car ms)) col) (cdr (car ms)))
-          (else (loop (cdr ms) (cdr (car ms)))))))
+;; Given a line's targets (sorted by column) and the cursor byte column, pick
+;; the first one ending at or after the column: the cursor on a numbered
+;; link's text lands before its trailing [N], and on a bare URL it lands
+;; inside the URL itself. Falls back to the last target on the line.
+(define (em--pick-target targets col)
+  (let loop ((ts targets) (fallback (car targets)))
+    (cond ((null? ts) fallback)
+          ((>= (nth (car ts) 1) col) (car ts))
+          (else (loop (cdr ts) (car ts))))))
 
 ;; The HTML mail renderer: reader-mode extraction + structured layout, with
 ;; the numbered links appended as a footer, falling back to the regex
@@ -2981,19 +3006,19 @@
                                   (if (null? c)
                                       acc
                                       (cons (cons (string->number (nth c 1)) (nth c 2)) acc)))))))
-             ;; Absolute byte spans of every [N] marker, painted as links.
+             ;; Absolute byte spans of every link — the [N] markers of an HTML
+             ;; body and the bare URLs of a text/plain one — painted as links.
              (ospans (let walk ((ls all) (abs 0) (acc '()))
                        (if (null? ls)
                            (reverse acc)
                            (walk (cdr ls) (+ abs (em--bytelen (car ls)) 1)
-                                 (let a ((ms (emw--line-markers (car ls))) (acc acc))
-                                   (if (null? ms)
+                                 (let a ((ts (em--line-targets (car ls) links)) (acc acc))
+                                   (if (null? ts)
                                        acc
-                                       (let* ((bc (car (car ms)))
-                                              (n (cdr (car ms)))
-                                              (s (+ abs bc))
-                                              (e (+ s 2 (string-length (number->string n)))))
-                                         (a (cdr ms) (cons (list s e "keyword") acc))))))))))
+                                       (let ((t (car ts)))
+                                         (a (cdr ts)
+                                            (cons (list (+ abs (nth t 0)) (+ abs (nth t 1)) "keyword")
+                                                  acc))))))))))
         (em--st! 'view-lines all)
         (em--st! 'view-links links)
         (render-buffer "*email-view*" "email-view-mode"
@@ -4889,20 +4914,20 @@
                                (replace-regexp-in-string "[^A-Za-z0-9]+" "-" (em--truncate s 40)))
                         ".patch")))))
 
-;; enter / click on a link: pick the [N] marker at (or after) the cursor
-;; column on this line and open its URL in the default browser. This is the
-;; ONLY way message content reaches the network, and it is always an explicit
-;; user action on a visible marker — never automatic.
+;; enter / click on a link: pick the link at (or after) the cursor column on
+;; this line — an HTML body's [N] marker, or a bare http(s) URL in a
+;; text/plain one — and open it in the default browser. This is the ONLY way
+;; message content reaches the network, and it is always an explicit user
+;; action on a visible link — never automatic.
 (define (email-view-follow)
   (let* ((lines (em--st 'view-lines))
          (idx (buffer-line))
          (text (if (and (>= idx 0) (< idx (length lines))) (nth lines idx) ""))
-         (markers (emw--line-markers text)))
-    (if (null? markers)
+         (targets (em--line-targets text (em--st 'view-links))))
+    (if (null? targets)
         (message "email: no link on this line")
         (let* ((col (- (point) (car (line-bounds))))
-               (n (emw--pick-marker markers col))
-               (url (em--aget (em--st 'view-links) n)))
+               (url (nth (em--pick-target targets col) 2)))
           (if url
               (begin (open-url url)
                      (message (string-append "email: opened " url)))

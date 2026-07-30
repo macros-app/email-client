@@ -366,10 +366,12 @@ outbox count when either applies.
   tag-stripper remains as the fallback for pathological input.
 - **Privacy**: rendering HTML mail makes **no network connections**. Remote
   images are never fetched — `<img>` contributes only its alt text, so
-  tracking pixels and read receipts stay inert. Links render as `[N]`
-  markers; `enter` (or a click) on one opens it in your default browser —
-  always an explicit user action on a visible marker, never automatic. The
-  only other browser-openers are the OAuth login flow and the `b` key.
+  tracking pixels and read receipts stay inert. HTML links render as `[N]`
+  markers, and a text/plain body's bare `http(s)://…` URLs are links as they
+  stand; both are highlighted, and `enter` (or a click) on one opens it in
+  your default browser — always an explicit user action on a visible link,
+  never automatic. The only other browser-openers are the OAuth login flow
+  and the `b` key.
 - **Compose**: `C-c C-a` opens a file picker and adds an `Attach:` header
   line (or type one yourself); `C-c C-b` adds a `Bcc:` header. On the
   To/Cc/Bcc lines, addresses autocomplete (`M-i`, and the automatic
